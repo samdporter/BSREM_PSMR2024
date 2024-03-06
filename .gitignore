@@ -1,0 +1,10 @@
+# all data files created by the program
+*.hs
+*.s
+*.hv
+*.v
+*.ahv
+!data/*
+
+# pycache
+*__pycache__/
