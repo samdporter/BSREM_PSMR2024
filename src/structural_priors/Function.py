@@ -126,7 +126,7 @@ class ScalarScaledFunction(Function):
         self.scalar = scalar
         
     def __call__(self, x):
-        return self.function(self.scalar * x) 
+        return self.scalar * self.function(x) 
 
     def convex_conjugate(self, x):
         return self.scalar * self.function.convex_conjugate(x/self.scalar)

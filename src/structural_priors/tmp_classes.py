@@ -246,8 +246,7 @@ class FairL21Norm(Function):
         self.delta = delta
 
     def forward(self, x):
-        res = _fairl21(x.astype(np.float64), self.delta)
-        return res
+        return _fairl21(x.astype(np.float64), self.delta)
     
     def gradient(self, x):
         return _fairl21_grad(x.astype(np.float64), self.delta)

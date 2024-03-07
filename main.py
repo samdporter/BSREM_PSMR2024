@@ -303,7 +303,7 @@ def main(args):
                            update_objective_interval=args.update_interval, save_path=args.output_path)
 
     bsrem.max_iteration=args.iterations
-    bsrem.run(args.iterations)
+    bsrem.run(args.iterations, verbose=2)
 
     return bsrem
 
