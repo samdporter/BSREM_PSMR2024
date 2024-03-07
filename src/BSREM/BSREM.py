@@ -8,19 +8,23 @@
 # Copyright 2024 University College London
 
 import numpy
+import os
 import sirf.STIR as STIR
 from sirf.Utilities import examples_data_path
 
 from cil.optimisation.algorithms import Algorithm 
+from cil.framework import DataContainer, BlockDataContainer
 
 class BSREMSkeleton(Algorithm):
-    def __init__(self, data, initial, initial_step_size, relaxation_eta, **kwargs):
+    def __init__(self, data, initial, initial_step_size, 
+                 relaxation_eta, stochastic=False, **kwargs):
         super(BSREMSkeleton, self).__init__(**kwargs)
-        self.x = initial.copy()
+        self.x = initial.copy().maximum(0)
         self.data = data
         self.num_subsets = len(data)
         self.initial_step_size = initial_step_size
         self.relaxation_eta = relaxation_eta
+        self.stochastic = stochastic
         # compute small number to add to image in preconditioner
         # don't make it too small as otherwise the algorithm cannot recover from zeroes.
         self.eps = initial.max()/1e6
@@ -60,7 +64,15 @@ class BSREMSkeleton(Algorithm):
         # threshold to non-negative
         self.x.maximum(0, out=self.x)
 
-        self.subset = (self.subset + 1) % self.num_subsets
+        if self.stochastic:
+            self.subset = numpy.random.randint(self.num_subsets)
+        else:
+            self.subset = (self.subset + 1) % self.num_subsets
+
+        if self.iteration % self.update_objective_interval == 0:
+            self.add_images()
+
+    def add_images(self):
         # store images here (not yet using callback)
         self.images.append(self.x.copy())
 
@@ -87,7 +99,7 @@ class BSREM1(BSREMSkeleton):
 
     def subset_gradient(self, x, subset_num):
         ''' Compute gradient at x for a particular subset'''
-        return self.obj_funs[self.subset].gradient(x)
+        return self.obj_funs[self.subset].gradient(x) - self.prior.gradient(x)
 
 
 class BSREM2(BSREMSkeleton):
@@ -180,3 +192,37 @@ class BSREMmm(BSREMSkeleton):
             df.append(loss)
         p = self.prior(self.x)
         self.loss.append([sum(df)+p, sum(df), p]+df)
+        
+class BSREMmm_of(BSREMSkeleton):
+    ''' BSREM implementation using sirf.STIR objective functions'''
+    def __init__(self, data, obj_fun, prior, initial, initial_step_size=1, relaxation_eta=0, save_path='', **kwargs):
+        '''
+        construct Algorithm with lists of data and, objective functions, initial estimate, initial step size,
+        step-size relaxation (per epoch) and optionally Algorithm parameters
+        '''
+        self.obj_fun = obj_fun
+        self.prior = prior
+        self.save_path = save_path
+        super(BSREMmm_of, self).__init__(data, initial, initial_step_size, relaxation_eta, **kwargs)
+        self.FOV_filter = DC_Filter()
+    def subset_sensitivity(self, subset_num):
+        ''' Compute sensitivity for a particular subset'''
+        # note: sirf.STIR Poisson likelihood uses `get_subset_sensitivity(0) for the whole
+        # sensitivity if there are no subsets in that likelihood
+        return self.obj_fun.get_subset_sensitivity(subset_num)
+
+    def subset_gradient(self, x, subset_num):
+        ''' Compute gradient at x for a particular subset'''
+        return self.obj_fun.get_subset_gradient(x, subset_num) - self.prior.gradient(x)/self.num_subsets
+    
+    def update_objective(self):
+        df = self.obj_fun(self.x)
+        p = self.prior(self.x)
+        self.loss.append([df+p, df, p])
+        
+    def add_images(self):
+        if isinstance(self.x, DataContainer):
+            self.x.write(os.path.join(self.save_path, 'BSREMmm_of_' + str(self.iteration) + '.hv'))
+        elif isinstance(self.x, BlockDataContainer):
+            for i, el in enumerate(self.x.containers):
+                el.write(os.path.join(self.save_path, 'BSREMmm_of_' + str(self.iteration) + '_modality_' + str(i) + '.hv'))
