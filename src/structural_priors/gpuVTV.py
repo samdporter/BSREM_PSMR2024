@@ -1,13 +1,22 @@
+import os
+import sys
+import subprocess
+
+# Set the environment variable
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".2"
+
 from Function import Function
 from jax import jit, vmap, device_get
 import jax.numpy as jnp
+
+
 
 @jit
 def singular_vals(A):
     return jnp.linalg.svd(A, compute_uv=False)
 
 @jit
-def sum_singular(A):
+def sum_singular(A, eps):
     return jnp.sum(singular_vals(A))
 
 @jit
@@ -68,7 +77,8 @@ class GPUVectorialTotalVariation(Function):
             start_idx = i * batch_size
             end_idx = min((i + 1) * batch_size, total_elements)
             batch = x[start_idx:end_idx]
-            result += jnp.sum(vmap(sum_func)(batch))
+            eps_arr = jnp.ones(batch.shape[0]) * self.eps
+            result += jnp.sum(vmap(sum_func)(batch, eps_arr))
 
         return device_get(result)
     
@@ -93,7 +103,7 @@ class GPUVectorialTotalVariation(Function):
             tau_arr = jnp.ones(batch.shape[0]) * tau
             result.append(vmap(nuc_norm_proximal)(batch, tau_arr))
 
-        return device_get(jnp.concatenate(result, axis=0).reshape(original_shape))
+        return jnp.concatenate(result, axis=0).reshape(original_shape)
     
     def gradient(self, x):
 
@@ -115,7 +125,7 @@ class GPUVectorialTotalVariation(Function):
             eps_arr = jnp.ones(batch.shape[0]) * self.eps
             result.append(vmap(nuc_norm_gradient)(batch, eps_arr))
         
-        return device_get(jnp.concatenate(result, axis=0).reshape(original_shape))
+        return jnp.concatenate(result, axis=0).reshape(original_shape)
     
     def convex_conjugate(self, x):
 
@@ -137,3 +147,6 @@ class GPUVectorialTotalVariation(Function):
             result += jnp.sum(vmap(nuc_norm_convex_conjugate)(batch))
 
         return device_get(result)
+
+
+

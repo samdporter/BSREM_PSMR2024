@@ -1,4 +1,4 @@
-from python_optimisation.misc import BlockDataContainer
+from .BlockDataContainer import BlockDataContainer
 import numpy as np
 from numba import njit, prange, jit
 
@@ -179,3 +179,40 @@ class BlockOperator(Operator):
             for op, arr in zip(self.operators,x.containers):
                 res.append(op.adjoint(arr))
             return BlockDataContainer(res) 
+        
+# Class definitions to put DataContainer into Numpy array and back
+class NumpyBlockDataContainer(Operator):
+
+    def __init__(self, domain_geometry, operator):
+
+        self.domain_geometry = domain_geometry
+        self.array = np.stack([np.zeros((d.shape)) for d in domain_geometry.containers], axis=-1)
+        self.operator = operator
+
+    def direct(self, x, out=None):
+        x_arr = np.stack([d.as_array() for d in x.containers], axis=-1)
+        return self.operator.direct(x_arr)
+
+    def adjoint(self, x, out=None):
+        x_arr = self.operator.adjoint(x)
+        res = self.domain_geometry.clone()
+        for i, r in enumerate(res.containers):
+            r.fill(x_arr[...,i])
+        return res  
+
+class NumpyDataContainer(Operator):
+
+    def __init__(self, domain_geometry, operator):
+
+        self.domain_geometry = domain_geometry
+        self.array = domain_geometry.as_array()
+        self.operator = operator
+
+    def direct(self, x, out=None):
+        x_arr = x.as_array()
+        return self.operator.direct(x_arr)
+
+    def adjoint(self, x, out=None):
+        res = self.domain_geometry.clone()
+        res.fill(self.operator.adjoint(x))
+        return res

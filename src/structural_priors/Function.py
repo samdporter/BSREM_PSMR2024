@@ -2,6 +2,8 @@ from numbers import Number
 import numpy as np
 from numba import njit
 
+from cil.framework import BlockDataContainer
+
 @njit
 def multiply_array(x, y):
 
@@ -332,3 +334,29 @@ def test_proximal(function, shape, num_tests, tau, epsilon=1e-5, print_output=Tr
         else: # This else belongs to the for, not the if; executed if the loop doesn't break
             print(f"Test {test+1}: Proximal mapping verification passed.")
 
+
+class SIRFBlockFunction(Function):
+    
+    def __init__(self, functions):
+        self.functions = functions
+        
+    def __call__(self, x):
+        return sum(f(el) for f, el in zip(self.functions, x.containers))
+    
+    def get_num_subsets(self):
+        return max(f.get_num_subsets() for f in self.functions)
+    
+    def get_gradient(self, x):
+        return BlockDataContainer(*[f.get_gradient(el) for f, el in zip(self.functions, x.containers)])
+
+    def get_single_subset_gradient(self, x, subset=0, modality=0):
+        return BlockDataContainer(*[f.get_subset_gradient(el, subset) if i == modality else \
+            el.clone().fill(0) for i, f, el in zip(range(len(self.functions)), self.functions, x.containers)])
+
+    def get_subset_gradient(self, x, subset=0):
+        
+        return BlockDataContainer(*[f.get_subset_gradient(el, subset) for f, el in zip(self.functions, x.containers)])   
+   
+    def get_subset_sensitivity(self, subset_num):
+
+        return BlockDataContainer(*[f.get_subset_sensitivity(subset_num) for f in self.functions])

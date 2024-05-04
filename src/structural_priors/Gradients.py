@@ -122,23 +122,27 @@ class BlockOperator(Operator):
 class Jacobian(Operator):
     def __init__(self, voxel_sizes=(1,1,1), weights=[1,1,1],
                  bnd_cond = 'Neumann', method='forward', 
-                 anatomical = None,
+                 anatomical = None, numpy_out = True,
                  gpu=False) -> None:
         
         self.voxel_sizes= voxel_sizes
         self.weights = weights
         self.gpu = gpu
+        self.numpy_out = numpy_out
 
         self.anatomical = device_get(anatomical)
         if self.anatomical is None:
-            self.grad = Gradient(voxel_sizes=self.voxel_sizes, method=method, bnd_cond=bnd_cond, gpu=gpu)
+            self.grad = Gradient(voxel_sizes=self.voxel_sizes, method=method, bnd_cond=bnd_cond, gpu=gpu, numpy_out=False)
         else:
-            self.grad = DirectionalGradient(self.anatomical, voxel_sizes=self.voxel_sizes, method=method, bnd_cond=bnd_cond, gpu=gpu)
+            self.grad = DirectionalGradient(self.anatomical, voxel_sizes=self.voxel_sizes, method=method, bnd_cond=bnd_cond, gpu=gpu, numpy_out=False)
 
     def direct(self, images):
         num_images = images.shape[-1]
         jac_list = [self.weights[idx] * self.grad.direct(images[..., idx]) for idx in range(num_images)]
-        res =  np.stack(jac_list, axis=-2)
+        if self.gpu:
+            res = jnp.stack(jac_list, axis=-2)
+        else:
+            res =  np.stack(jac_list, axis=-2)
         # clear memory
         del jac_list
         return res
@@ -148,16 +152,23 @@ class Jacobian(Operator):
         adjoint_list = []
         for idx in range(num_images):
             adjoint_list.append(self.weights[idx] * self.grad.adjoint(jacobians[..., idx,:]))
-        res =  np.stack(adjoint_list, axis=-1)
+        if self.gpu:
+            res = jnp.stack(adjoint_list, axis=-1)
+            if self.numpy_out:
+                return device_get(res)
+        else:
+            res =  np.stack(adjoint_list, axis=-1)
         return res
     
 class Gradient(Operator):
 
-    def __init__(self, voxel_sizes, method='forward', bnd_cond='Neumann', 
+    def __init__(self, voxel_sizes, method='forward', bnd_cond='Neumann', numpy_out=True,
                  gpu=False):
         self.voxel_sizes = voxel_sizes
         self.method = method
         self.boundary_condition = bnd_cond
+        self.numpy_out = numpy_out
+        self.gpu = gpu
 
         if gpu:
             self.FD = GPUFiniteDifferenceOperator(self.voxel_sizes[0], direction=0, method=self.method, bnd_cond=self.boundary_condition)
@@ -170,7 +181,13 @@ class Gradient(Operator):
             self.FD.direction = i
             self.FD.voxel_sizes= self.voxel_sizes[i]
             res.append(self.FD.direct(x))
-        return np.stack(res, axis=-1)
+        if self.gpu:
+            if self.numpy_out:
+                return device_get(jnp.stack(res, axis=-1))
+            else:
+                return jnp.stack(res, axis=-1)
+        else:
+            return np.stack(res, axis=-1)
 
     def adjoint(self, x):
         res = []
@@ -182,7 +199,9 @@ class Gradient(Operator):
     
 class DirectionalGradient(Operator):
 
-    def __init__(self, anatomical, voxel_sizes, gamma=1, eta=1e-6, method='forward', bnd_cond='Neumann', gpu=False) -> None:
+    def __init__(self, anatomical, voxel_sizes, gamma=1, eta=1e-6,
+                  method='forward', bnd_cond='Neumann', numpy_out=True,
+                  gpu=False) -> None:
 
         self.anatomical = device_get(anatomical)
         self.voxel_size = voxel_sizes
@@ -190,6 +209,8 @@ class DirectionalGradient(Operator):
         self.eta = eta
         self.method = method
         self.boundary_condition = bnd_cond
+        self.numpy_out = numpy_out
+        self.gpu = gpu
 
         if gpu:
             self.FD = GPUFiniteDifferenceOperator(self.voxel_size[0], direction=0, method=self.method, bnd_cond=self.boundary_condition)
@@ -211,8 +232,12 @@ class DirectionalGradient(Operator):
             self.FD.direction = i
             self.FD.voxel_sizes = self.voxel_size[i]
             res.append(self.FD.direct(x))
-        res = np.stack(res, axis=-1)
-        return device_get(self.directional_op(res, self.anatomical_grad, self.gamma, self.eta))
+        if self.gpu:
+            res = jnp.stack(res, axis=-1)
+            return device_get(self.directional_op(res, self.anatomical_grad, self.gamma, self.eta))
+        else:
+            res = np.stack(res, axis=-1)
+            return device_get(self.directional_op(res, self.anatomical_grad, self.gamma, self.eta))
         
     def adjoint(self, x):
         x = self.directional_op(x, self.anatomical_grad, self.gamma, self.eta)
@@ -221,6 +246,8 @@ class DirectionalGradient(Operator):
             self.FD.direction = i
             self.FD.voxel_sizes = self.voxel_size[i]
             res.append(device_get(self.FD.adjoint(x[..., i])))
+        if self.numpy_out:
+            res = device_get(res)
         return -sum(res)
     
 

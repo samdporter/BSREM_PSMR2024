@@ -1,10 +1,10 @@
 import sys
-sys.path.insert(0,'/home/sam/working/SIRF-Contribs/src/Python/sirf/contrib/structural_priors')
+sys.path.insert(0,'/home/sam/working/BSREM_PSMR2024/src/structural_priors')
 from Function import Function
 
-def create_vectorial_total_variation(gpu=False, eps=1e-8, num_batches=3, smoothing_function='fair'):
+def create_vectorial_total_variation(gpu=False, eps=1e-8, num_batches=3, smoothing_function=None):
     if gpu:
-        from gpuVTV import GPUVectorialTotalVariation
+        from .gpuVTV import GPUVectorialTotalVariation
         # Initialize and return a GPUVectorialTotalVariation instance
         return GPUVectorialTotalVariation(eps=eps, num_batches=num_batches, smoothing_function=smoothing_function)
     else:
@@ -15,5 +15,5 @@ def create_vectorial_total_variation(gpu=False, eps=1e-8, num_batches=3, smoothi
 
 class VectorialTotalVaration(Function):
 
-    def __init__(self, gpu=False, eps=1e-8, num_batches=3, smoothing_function='fair', operator=None):
+    def __init__(self, gpu=False, eps=1e-8, num_batches=3, smoothing_function=None, operator=None):
         self.vtv = create_vectorial_total_variation(gpu, eps, num_batches, smoothing_function)

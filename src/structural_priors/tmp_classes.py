@@ -3,6 +3,7 @@
 
 from .Function import Function, OperatorCompositionFunction
 from .Operator import Operator
+import torch
 
 from sirf.STIR import SeparableGaussianImageFilter, ImageData
 import stirextra
@@ -554,7 +555,10 @@ class CompositionOperator(Operator):
         return res
             
     def adjoint(self, x):
-        res = x.copy()
+        if isinstance(x, torch.Tensor):
+            res = x.clone()
+        else:
+            res = x.copy()
         for op in self.ops[::-1]:
             res = op.adjoint(res)
         return res

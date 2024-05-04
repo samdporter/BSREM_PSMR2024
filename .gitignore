@@ -8,3 +8,20 @@
 
 # pycache
 *__pycache__/
+
+# directory for testing etc
+ignore/
+
+tmp/
+
+*.ipynb
+
+results/
+
+analysis/
+
+src/BSREM/partitioner
+
+scripts/
+
+src/structural_priors/obsolete/
