@@ -8,7 +8,7 @@ def create_vectorial_total_variation(gpu=False, eps=1e-8, num_batches=3, smoothi
         # Initialize and return a GPUVectorialTotalVariation instance
         return GPUVectorialTotalVariation(eps=eps, num_batches=num_batches, smoothing_function=smoothing_function)
     else:
-        from cpuVTV import CPUVectorialTotalVariation
+        from .cpuVTV import CPUVectorialTotalVariation
         # Initialize and return a CPUVectorialTotalVariation instance
         return CPUVectorialTotalVariation(eps=eps, smoothing_function=smoothing_function)
     
