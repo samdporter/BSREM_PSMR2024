@@ -61,10 +61,18 @@ args = parser.parse_args()
 sys.path.insert(0, args.source_path)
 from BSREM.BSREM import BSREMmm_of
 from structural_priors.tmp_classes import (OperatorCompositionFunction,
-                                                   ZoomOperator, CompositionOperator,
+                                                    CompositionOperator,
                                                     NiftyResampleOperator,
                                                     FairL21Norm,
                                                 )
+
+# Check if the method exists
+if hasattr(ImageData, 'zoom_image_from_template'):
+    from structural_priors.tmp_classes import sirfZoomOperator  # Use my own SIRF class to zoom to template
+    ZoomOperator = sirfZoomOperator
+else:
+    from structural_priors.tmp_classes import stirZoomOperator  # Use complicated STIR class to zoom to template
+    ZoomOperator = stirZoomOperator
 
 from structural_priors.Operator import Operator, NumpyDataContainer, NumpyBlockDataContainer
 from structural_priors.Function import Function, SIRFBlockFunction

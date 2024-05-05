@@ -578,10 +578,10 @@ class stirZoomOperator(Operator):
         i = random.randint(0, 1000000)
 
         self.ref.write(f'tmp_ref{i}.hv')
-        self.ref_stir = FloatVoxelsOnCartesianGrid.read_from_file(f'ref{i}.hv')
+        self.ref_stir = FloatVoxelsOnCartesianGrid.read_from_file(f'tmp_ref{i}.hv')
         os.remove(f'tmp_ref{i}.hv')
         self.float.write(f'tmp_float{i}.hv')
-        self.float_stir = FloatVoxelsOnCartesianGrid.read_from_file(f'float{i}.hv')
+        self.float_stir = FloatVoxelsOnCartesianGrid.read_from_file(f'tmp_float{i}.hv')
         os.remove(f'tmp_float{i}.hv')
 
         if make_adjoint:
@@ -598,20 +598,20 @@ class stirZoomOperator(Operator):
     def direct(self, x):
 
         self.ref_stir.fill(0)
-        self.float_stir.fill(x)
+        self.float_stir.fill(x.as_array().flat)
         zoom_image(self.ref_stir, self.float_stir, self.preserve)
 
-        return self.ref.clone().fill(to_numpy(self.float_stir))
+        return self.ref.clone().fill(to_numpy(self.ref_stir))
             
     def adjoint(self, x):
 
-        self.ref_stir.fill(x)
+        self.ref_stir.fill(x.as_array().flat)
         self.float_stir.fill(0)
         zoom_image(self.float_stir, self.ref_stir, self.preserve)
 
         return self.float.clone().fill(to_numpy(self.float_stir))
     
-class ZoomOperator(Operator):
+class sirfZoomOperator(Operator):
     def __init__(self, ref, float, preserve = 'preserve_values', make_adjoint=True):
         self.ref = ref.get_uniform_copy(0)
         self.float = float.get_uniform_copy(0)
