@@ -318,7 +318,7 @@ if __name__ == "__main__":
     # move any leftover files to output path
     for file in os.listdir(args.working_path):
         if (file.endswith(".hv") or file.endswith(".v") or file.endswith(".ahv")):
-            print(f"Moving {file}")
+            print(f"Moving {file} to {args.output_path}")
             shutil.move(os.path.join(args.working_path, file), os.path.join(args.output_path, file))
 
     print("Done")
