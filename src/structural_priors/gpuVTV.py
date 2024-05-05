@@ -5,7 +5,7 @@ import subprocess
 # Set the environment variable
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".2"
 
-from Function import Function
+from .Function import Function
 from jax import jit, vmap, device_get
 import jax.numpy as jnp
 

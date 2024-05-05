@@ -2,7 +2,7 @@ from numba import njit, prange
 
 import numpy as np
 from numba import jit
-from Function import Function
+from .Function import Function
 
 
 @jit(nopython=True, parallel=True)

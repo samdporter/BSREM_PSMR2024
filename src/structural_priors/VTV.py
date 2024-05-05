@@ -1,6 +1,6 @@
 import sys
 sys.path.insert(0,'/home/sam/working/BSREM_PSMR2024/src/structural_priors')
-from Function import Function
+from .Function import Function
 
 def create_vectorial_total_variation(gpu=False, eps=1e-8, num_batches=3, smoothing_function=None):
     if gpu:
