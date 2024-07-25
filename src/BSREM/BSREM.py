@@ -98,15 +98,17 @@ class BSREMSkeleton(Algorithm):
         #return self.initial_step_size * (1-self.relaxation_eta)**self.epoch() # I think I like this version more
 
     def limit_size(self, x):
-        """This is horrible but necessary because some bugs somehere (possibly STIR)"""
+        """
+        This is horrible but necessary because some bugs somehere (possibly STIR)
+        They sory themselves out eventually, but this is a quick fix so I can compare objective values
+        """
         if isinstance(x, BlockDataContainer):
 
             for i, el in enumerate(x.containers):
                 update_arr = el.as_array()
-                update_arr[update_arr > self.update_max] = self.eps
                 if i ==1:
-                    update_arr[:28]=0
-                    update_arr[100:]=0
+                    update_arr[:11]=0
+                    update_arr[116:]=0
                 el.fill(update_arr)
         else:
             update_arr = x.as_array()
@@ -246,7 +248,7 @@ class BSREMmm_of(BSREMSkeleton):
     """
     def __init__(self, obj_fun, prior, initial, initial_step_size=1, relaxation_eta=0, save_path='', 
                  svrg=False, saga=False, stochastic=False, with_replacement=False, single_modality_update=False, 
-                 save_images =True, prior_is_subset=False, update_max=1e3, probabilities=None, svrg_fullgradient_interval=2, **kwargs):
+                 save_images =True, prior_is_subset=False, update_max=1e3, probabilities=None, svrg_fullgradient_interval=1, **kwargs):
         '''
         construct Algorithm with lists of data and, objective functions, initial estimate, initial step size,
         step-size relaxation (per epoch) and optionally Algorithm parameters
@@ -301,11 +303,6 @@ class BSREMmm_of(BSREMSkeleton):
         if self.svrg and self.saga:
             print("Can't be SVRG and SAGA! SVRG a coming")
             self.saga=False
-
-        if isinstance(self.x, BlockDataContainer):
-            self.image_max = [el.max() for el in self.x.containers]
-        else:
-            self.image_max = self.x.max()
 
         # write average_sensitivity
         if isinstance(self.average_sensitivity, BlockDataContainer):
@@ -416,19 +413,11 @@ class BSREMmm_of(BSREMSkeleton):
         """Compute full gradient at x."""
         print('Computing full gradient')
         prior_gradient = self.compute_prior_gradient() 
-        self.g.fill(0)
+        self.g*=0
 
         for i in range(self.num_subsets):
             self.sg[i] = self.compute_subset_gradient(i, prior_gradient)
             self.g += self.sg[i]
-
-        if isinstance(self.g, BlockDataContainer):
-            for i, el in enumerate(self.g.containers):
-                el.minimum(self.image_max[i]*10, out=el)
-                el.maximum(-self.image_max[i]*10, out=el)
-        else:
-            self.g.minimum(self.image_max, out=self.g)
-            self.g.maximum(-self.image_max, out=self.g)
 
     def update_objective(self):
         df = self.obj_fun(self.x)
@@ -454,8 +443,8 @@ class BSREMmm_of(BSREMSkeleton):
         self.write_image(self.x, 'image')
         
         # If SVRG is enabled, write the gradient images as well
-        if self.svrg:
+        if self.svrg or self.saga:
             self.write_image(self.g, 'g')
-        #    for i, el in enumerate(self.sg):
-        #        self.write_image(el, f'sg_{i}')
+            for i, el in enumerate(self.sg):
+                self.write_image(el, f'sg_{i}')
         
