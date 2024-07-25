@@ -3,7 +3,7 @@
 #
 # Classes implementing the BSREM algorithm in sirf.STIR
 #
-# Authors:  Kris Thielemans
+# Authors:  Kris Thielemans, Sam Porter
 #
 # Copyright 2024 University College London
 
@@ -26,27 +26,11 @@ def timing(label: str):
     t1 = time.time()
     print(f'{label}: {t1 - t0:.6f} seconds')
 
-def truncate_to_cylinder(image, radius, center=None):
-    """
-    Crop a 3D numpy array to a cylinder shape along the z-axis.
-    """
-    print("Truncating image to cylinder")
-    array = image.as_array()
-    z_dim, y_dim, x_dim = array.shape
-    if center is None:
-        center = (y_dim // 2, x_dim // 2)
-    y_indices, x_indices = numpy.ogrid[:y_dim, :x_dim]
-    mask = (y_indices - center[0])**2 + (x_indices - center[1])**2 <= radius**2
-    cropped_array = numpy.zeros_like(array)
-    for z in range(z_dim):
-        cropped_array[z] = array[z] * mask
-    image.fill(cropped_array)
-
 
 class BSREMSkeleton(Algorithm):
     def __init__(self, initial, initial_step_size, num_subsets,
                  relaxation_eta, stochastic=False, with_replacement=False, 
-                 save_images=True, prior_is_subset=False, update_max = 1e3, probabilities = None,
+                 save_images=True, prior_is_subset=False, update_max = 100, probabilities = None,
                   **kwargs):
 
         super(BSREMSkeleton, self).__init__(**kwargs)
@@ -56,7 +40,7 @@ class BSREMSkeleton(Algorithm):
 
         # initialise image estimate
         self.x = initial.copy().maximum(0)
-        self.FOV_filter.apply(self.x)
+        self.FOV_filter(self.x)
 
         # parameters controlling step size
         self.initial_step_size = initial_step_size
@@ -110,19 +94,19 @@ class BSREMSkeleton(Algorithm):
 
     def step_size(self):
         # reduce step size once per epoch
-        #return self.initial_step_size / (1 + self.relaxation_eta * self.epoch())
-        return self.initial_step_size * (1-self.relaxation_eta)**self.epoch() # I think I like this version more
-
+        return self.initial_step_size / (1 + self.relaxation_eta * self.epoch())
+        #return self.initial_step_size * (1-self.relaxation_eta)**self.epoch() # I think I like this version more
 
     def limit_size(self, x):
+        """This is horrible but necessary because some bugs somehere (possibly STIR)"""
         if isinstance(x, BlockDataContainer):
 
             for i, el in enumerate(x.containers):
                 update_arr = el.as_array()
                 update_arr[update_arr > self.update_max] = self.eps
                 if i ==1:
-                    update_arr[:12]=0
-                    update_arr[115:]=0
+                    update_arr[:28]=0
+                    update_arr[100:]=0
                 el.fill(update_arr)
         else:
             update_arr = x.as_array()
@@ -132,7 +116,7 @@ class BSREMSkeleton(Algorithm):
     def update(self):
 
         # if we want to and it's the end of an epoch, lets save our images
-        if  self.iteration % self.num_subsets == 0 and self.save_images:
+        if  self.iteration % self.update_objective_interval == 0 and self.save_images:
             self.add_images()
 
         # choose our subset base on subset management strategy
@@ -143,9 +127,9 @@ class BSREMSkeleton(Algorithm):
 
         # calculate our image update
         self.x_update = (self.x) * g / self.average_sensitivity * self.step_size()
-        self.limit_size(self.x_update)
+        self.limit_size(self.x_update) # necessary because of some bugs somewhere
 
-        self.FOV_filter.apply(self.x_update)
+        self.FOV_filter(self.x_update)
         self.x += self.x_update
         self.x.maximum(self.eps, out=self.x)
             
@@ -167,7 +151,6 @@ class BSREMSkeleton(Algorithm):
             available_subsets = list(range(self.num_subsets))
             return numpy.random.choices(available_subsets, self.probabilities)
 
-
     def _choose_without_replacement(self):
         """Choose a subset without replacement, ensuring no repeat until all subsets are used."""
         if len(self.used_subsets) >= self.num_subsets:
@@ -185,27 +168,67 @@ class BSREMSkeleton(Algorithm):
     # next is needed for CIL 21.3, but we don't do any calculation to save time
     def update_objective(self):
         self.loss.append(0)
+
+def apply_cylinder_mask(image, margin_y, margin_x):
+    """ Sets elements outside a cylinder along the z-axis to zero. """
+
+    array = image.as_array()
+
+    z_dim, y_dim, x_dim = array.shape
+
+    # Determine the radius and center of the cylinder
+    radius_y = (y_dim - 2 * margin_y) / 2
+    radius_x = (x_dim - 2 * margin_x) / 2
+    radius = min(radius_y, radius_x)
+    
+    center_y = y_dim // 2
+    center_x = x_dim // 2
+
+    # Create a grid of coordinates
+    y, x = numpy.ogrid[:y_dim, :x_dim]
+
+    # Compute the distance from the center for each point in the (y, x) plane
+    distance_from_center = numpy.sqrt((y - center_y)**2 + (x - center_x)**2)
+
+    # Create a mask for the cylinder
+    cylinder_mask = distance_from_center <= radius
+
+    # Expand the mask to the third dimension (z-axis)
+    full_mask = numpy.repeat(cylinder_mask[numpy.newaxis, :, :], z_dim, axis=0)
+
+    # Apply the mask to the array
+    masked_array = array * full_mask
+
+    image.fill(masked_array)
+
     
 class DC_Filter():
 
-    def __init__(self, eps=0):
+    def __init__(self, margin=10):
         self.FOV_filter = STIR.TruncateToCylinderProcessor()
         self.FOV_filter.set_strictly_less_than_radius(True)
 
+        self.margin = margin
+
+    def __call__(self, x):
+        #self.apply_cylinder_mask(x)
+        self.apply(x)
 
     def apply(self, x):
         if isinstance(x, BlockDataContainer):
-            for el in x.containers:
-                self.FOV_filter.apply(el)
+            for i, el in enumerate(x.containers):
+                if i == 0:
+                    self.FOV_filter.apply(el)
         else:
             self.FOV_filter.apply(x)
 
-    def apply2(self, x):
-        if isinstance(x, BlockDataContainer):
-            for el in x.containers:
-                truncate_to_cylinder(el, radius=el.shape[1]//2-16)
+    def apply_cylinder_mask(self, image):
+        if isinstance(image, BlockDataContainer):
+            for i, el in enumerate(image.containers):
+                if i == 0:
+                    apply_cylinder_mask(el, margin_y=self.margin, margin_x=self.margin)
         else:
-            truncate_to_cylinder(x, radius=x.shape[1]//2-16)
+            apply_cylinder_mask(image, margin_y=self.margin, margin_x=self.margin)
         
 class BSREMmm_of(BSREMSkeleton):
     """
@@ -222,8 +245,8 @@ class BSREMmm_of(BSREMSkeleton):
         **kwargs: Additional keyword arguments
     """
     def __init__(self, obj_fun, prior, initial, initial_step_size=1, relaxation_eta=0, save_path='', 
-                 svrg=False, stochastic=False, with_replacement=False, single_modality_update=False, 
-                 save_images =True, prior_is_subset=False, update_max=1e3, probabilities=None, **kwargs):
+                 svrg=False, saga=False, stochastic=False, with_replacement=False, single_modality_update=False, 
+                 save_images =True, prior_is_subset=False, update_max=1e3, probabilities=None, svrg_fullgradient_interval=2, **kwargs):
         '''
         construct Algorithm with lists of data and, objective functions, initial estimate, initial step size,
         step-size relaxation (per epoch) and optionally Algorithm parameters
@@ -256,11 +279,33 @@ class BSREMmm_of(BSREMSkeleton):
                 self.g = initial.clone()*0
                 self.sg = [initial.clone()*0 for i in range(self.num_subsets)]
                 self.full_gradient()
+                self.svrg_fullgradient_interval = svrg_fullgradient_interval
             #except:
             #    print("Something gone wrong with SVRG. Setting to False")
             #    self.svrg = False
         else:
             self.svrg = False
+            
+        if saga:
+            self.saga = True
+            if not stochastic:
+                print("SAGA requires stochastic=True. Setting to True")
+                self.stochastic = True
+            self.count = 0
+            self.g = initial.clone()*0
+            self.sg = [initial.clone()*0 for i in range(self.num_subsets)]
+            self.full_gradient()
+        else:
+            self.saga = False
+            
+        if self.svrg and self.saga:
+            print("Can't be SVRG and SAGA! SVRG a coming")
+            self.saga=False
+
+        if isinstance(self.x, BlockDataContainer):
+            self.image_max = [el.max() for el in self.x.containers]
+        else:
+            self.image_max = self.x.max()
 
         # write average_sensitivity
         if isinstance(self.average_sensitivity, BlockDataContainer):
@@ -284,26 +329,27 @@ class BSREMmm_of(BSREMSkeleton):
         print(f"Computing subset gradient {subset_num + 1} of {self.num_subsets} subsets")
 
         subset_grad = self.compute_subset_gradient(subset_num, prior_gradient=None)
-        return self.apply_svrg_if_enabled(subset_grad, subset_num)
+        return self.apply_variance_reduction_if_enabled(subset_grad, subset_num)
 
     def compute_prior_gradient(self):
         with timing('prior gradient time'):
             return self.prior.gradient(self.x)
-
 
     def compute_subset_gradient(self, subset_num, prior_gradient):
         """Compute gradient for a specific subset, optionally using prior gradient."""
         if self.prior_is_subset and subset_num == self.num_subsets - 1:
             if prior_gradient is None:
                 prior_gradient = self.compute_prior_gradient()
+            self.FOV_filter(prior_gradient)
             return -prior_gradient
 
         if self.single_modality_update:
-            return self._compute_single_modality_gradient(subset_num, prior_gradient)
+            return self._compute_single_modality_subset_gradient(subset_num, prior_gradient)
 
-        return self._compute_general_gradient(subset_num, prior_gradient)
 
-    def _compute_single_modality_gradient(self, subset_num, prior_gradient):
+        return self._compute_general_subset_gradient(subset_num, prior_gradient)
+
+    def _compute_single_modality_subset_gradient(self, subset_num, prior_gradient):
         """Compute gradient for a specific modality subset."""
         modality, subset_within_modality = self.get_modality_indices(subset_num)
         modality_gradient = self.compute_modality_gradient(subset_within_modality, modality)
@@ -313,9 +359,11 @@ class BSREMmm_of(BSREMSkeleton):
                 prior_gradient = self.compute_prior_gradient()
             modality_gradient -= prior_gradient / self.num_subsets
 
+        self.FOV_filter(modality_gradient)
+
         return modality_gradient
 
-    def _compute_general_gradient(self, subset_num, prior_gradient):
+    def _compute_general_subset_gradient(self, subset_num, prior_gradient):
         """Compute general gradient across all subsets."""
         general_gradient = self.compute_general_gradient(subset_num)
 
@@ -323,6 +371,8 @@ class BSREMmm_of(BSREMSkeleton):
             if prior_gradient is None:
                 prior_gradient = self.compute_prior_gradient()
             general_gradient -= prior_gradient / self.num_subsets
+
+        self.FOV_filter(general_gradient)
 
         return general_gradient
 
@@ -342,16 +392,23 @@ class BSREMmm_of(BSREMSkeleton):
             o_grad = self.obj_fun.get_subset_gradient(self.x, subset_num)
         return o_grad
 
-    def apply_svrg_if_enabled(self, subset_grad, subset_num):
+    def apply_variance_reduction_if_enabled(self, subset_grad, subset_num):
         if self.svrg:
             self.update_svrg_gradients()
             print("Adjusting gradient using SVRG")
-            return subset_grad - self.sg[subset_num] + self.g / self.num_subsets
-        print("Not using SVRG")
+            return (subset_grad - self.sg[subset_num]) + self.g/self.num_subsets
+        if self.saga:
+            self.update_saga_gradients(subset_grad, subset_num)
+            return (subset_grad - self.sg[subset_num]) + self.g/self.num_subsets
+        print("Not using SVRG or SAGA")
         return subset_grad
+    
+    def update_saga_gradients(self, subset_grad, subset_num):
+        self.g += (subset_grad - self.sg[subset_num])
+        self.sg[subset_num] = subset_grad
 
     def update_svrg_gradients(self):
-        self.count = (self.count + 1) % self.num_subsets
+        self.count = (self.count + 1) % (self.num_subsets  * self.svrg_fullgradient_interval)
         if self.count == 0:
             self.full_gradient()
 
@@ -364,6 +421,14 @@ class BSREMmm_of(BSREMSkeleton):
         for i in range(self.num_subsets):
             self.sg[i] = self.compute_subset_gradient(i, prior_gradient)
             self.g += self.sg[i]
+
+        if isinstance(self.g, BlockDataContainer):
+            for i, el in enumerate(self.g.containers):
+                el.minimum(self.image_max[i]*10, out=el)
+                el.maximum(-self.image_max[i]*10, out=el)
+        else:
+            self.g.minimum(self.image_max, out=self.g)
+            self.g.maximum(-self.image_max, out=self.g)
 
     def update_objective(self):
         df = self.obj_fun(self.x)
@@ -391,6 +456,6 @@ class BSREMmm_of(BSREMSkeleton):
         # If SVRG is enabled, write the gradient images as well
         if self.svrg:
             self.write_image(self.g, 'g')
-            #for i, el in enumerate(self.sg):
-            #    self.write_image(el, f'sg_{i}')
+        #    for i, el in enumerate(self.sg):
+        #        self.write_image(el, f'sg_{i}')
         

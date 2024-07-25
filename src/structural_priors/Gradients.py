@@ -1,8 +1,6 @@
 import numpy as np
 from numba import njit, prange, jit
-import jax.numpy as jnp
-from jax import device_get
-from jax import jit as jjit
+import torch
 
 class Operator():
 
@@ -126,26 +124,30 @@ class Jacobian(Operator):
                  gpu=False) -> None:
         
         self.voxel_sizes= voxel_sizes
-        self.weights = weights
+        self.weights = weights # can presumably also be a list of arrays
         self.gpu = gpu
         self.numpy_out = numpy_out
 
-        self.anatomical = device_get(anatomical)
+        self.anatomical = anatomical
+
         if self.anatomical is None:
             self.grad = Gradient(voxel_sizes=self.voxel_sizes, method=method, bnd_cond=bnd_cond, gpu=gpu, numpy_out=False)
         else:
+            if gpu:
+                if isinstance(self.anatomical, np.ndarray):
+                    self.anatomical = torch.tensor(self.anatomical)
             self.grad = DirectionalGradient(self.anatomical, voxel_sizes=self.voxel_sizes, method=method, bnd_cond=bnd_cond, gpu=gpu, numpy_out=False)
 
     def direct(self, images):
         num_images = images.shape[-1]
         jac_list = [self.weights[idx] * self.grad.direct(images[..., idx]) for idx in range(num_images)]
         if self.gpu:
-            res = jnp.stack(jac_list, axis=-2)
+            res = torch.stack(jac_list, dim=-2)
         else:
             res =  np.stack(jac_list, axis=-2)
         # clear memory
         del jac_list
-        return res
+        return res.numpy() if self.numpy_out else res
 
     def adjoint(self, jacobians):
         num_images = jacobians.shape[-2]
@@ -153,49 +155,84 @@ class Jacobian(Operator):
         for idx in range(num_images):
             adjoint_list.append(self.weights[idx] * self.grad.adjoint(jacobians[..., idx,:]))
         if self.gpu:
-            res = jnp.stack(adjoint_list, axis=-1)
+            res = torch.stack(adjoint_list, dim=-1)
             if self.numpy_out:
-                return device_get(res)
+                return res.numpy() if self.numpy_out else res
         else:
             res =  np.stack(adjoint_list, axis=-1)
         return res
-    
-class Gradient(Operator):
 
-    def __init__(self, voxel_sizes, method='forward', bnd_cond='Neumann', numpy_out=True,
-                 gpu=False):
+class Gradient(Operator):
+    def __init__(self, voxel_sizes, method='forward', bnd_cond='Neumann', numpy_out=True, gpu=False):
         self.voxel_sizes = voxel_sizes
         self.method = method
-        self.boundary_condition = bnd_cond
+        self.bnd_cond = bnd_cond
         self.numpy_out = numpy_out
         self.gpu = gpu
 
-        if gpu:
-            self.FD = GPUFiniteDifferenceOperator(self.voxel_sizes[0], direction=0, method=self.method, bnd_cond=self.boundary_condition)
-        else:
-            self.FD = CPUFiniteDifferenceOperator(self.voxel_sizes[0], direction=0, method=self.method, bnd_cond=self.boundary_condition)
+        if not gpu:
+            self.FD = CPUFiniteDifferenceOperator(self.voxel_sizes[0], direction=0, method=self.method, bnd_cond=bnd_cond)
 
     def direct(self, x):
         res = []
-        for i in range(x.ndim):
-            self.FD.direction = i
-            self.FD.voxel_sizes= self.voxel_sizes[i]
-            res.append(self.FD.direct(x))
         if self.gpu:
-            if self.numpy_out:
-                return device_get(jnp.stack(res, axis=-1))
-            else:
-                return jnp.stack(res, axis=-1)
+            if isinstance(x, np.ndarray):
+                x = torch.tensor(x)
+            for i in range(x.ndim):
+                if self.method == 'forward':
+                    res.append(self.forward_diff(x, i))
+                elif self.method == 'backward':
+                    res.append(self.backward_diff(x, i))
+                else:
+                    raise ValueError('Not implemented')
+                if self.voxel_sizes[i] != 1.0:
+                    res[-1] /= self.voxel_sizes[i]
+            result = torch.stack(res, dim=-1)
+            return result.numpy() if self.numpy_out else result
         else:
+            for i in range(x.ndim):
+                self.FD.direction = i
+                self.FD.voxel_size = self.voxel_sizes[i]
+                res.append(self.FD.direct(x))
             return np.stack(res, axis=-1)
 
     def adjoint(self, x):
         res = []
-        for i in range(x.ndim-1):
+        if self.gpu:
+            if isinstance(x, np.ndarray):
+                x = torch.tensor(x)
+            for i in range(x.size(-1)):
+                if self.method == 'forward':
+                    res.append(-self.backward_diff(x[..., i], i))
+                elif self.method == 'backward':
+                    res.append(-self.forward_diff(x[..., i], i))
+                else:
+                    raise ValueError('Not implemented')
+                if self.voxel_sizes[i] != 1.0:
+                    res[-1] /= self.voxel_sizes[i]
+            result = torch.stack(res, dim=-1).sum(dim=-1)
+            return result.numpy() if self.numpy_out else result
+        for i in range(x.shape[-1]):
             self.FD.direction = i
-            self.FD.voxel_sizes= self.voxel_sizes[i]
+            self.FD.voxel_size = self.voxel_sizes[i]
             res.append(self.FD.adjoint(x[..., i]))
         return -sum(res)
+
+    def forward_diff(self, x, direction):
+        append_tensor = x.select(direction, 0 if self.bnd_cond == 'Periodic' else -1).unsqueeze(direction)
+        out = torch.diff(x, n=1, dim=direction, append=append_tensor)
+        if self.bnd_cond == 'Neumann':
+            out.select(direction, -1).zero_()
+        return out
+
+    def backward_diff(self, x, direction):
+        flipped_x = x.flip(direction)
+        append_tensor = flipped_x.select(direction, 0 if self.bnd_cond == 'Periodic' else -1).unsqueeze(direction)
+        out = -torch.diff(flipped_x, n=1, dim=direction, append=append_tensor).flip(direction)
+        if self.bnd_cond == 'Neumann':
+            out.select(direction, 0).zero_()
+        return out
+
     
 class DirectionalGradient(Operator):
 
@@ -203,179 +240,46 @@ class DirectionalGradient(Operator):
                   method='forward', bnd_cond='Neumann', numpy_out=True,
                   gpu=False) -> None:
 
-        self.anatomical = device_get(anatomical)
+        self.anatomical = anatomical
         self.voxel_size = voxel_sizes
         self.gamma = gamma
         self.eta = eta
         self.method = method
-        self.boundary_condition = bnd_cond
+        self.bnd_cond = bnd_cond
         self.numpy_out = numpy_out
         self.gpu = gpu
+        self.gradient = Gradient(voxel_sizes=self.voxel_size, method=self.method, bnd_cond=self.bnd_cond, numpy_out=numpy_out, gpu=self.gpu)
+
+        self.anatomical_grad = self.gradient.direct(self.anatomical)
 
         if gpu:
-            self.FD = GPUFiniteDifferenceOperator(self.voxel_size[0], direction=0, method=self.method, bnd_cond=self.boundary_condition)
-            self.directional_op = gpu_directional_op
+            self.directional_op = gpu_directional_op   
+            self.gradient.numpy_out = False         
         else:
-            self.FD = CPUFiniteDifferenceOperator(self.voxel_size[0], direction=0, method=self.method, bnd_cond=self.boundary_condition)
             self.directional_op = directional_op
 
-        anat_list = []
-        for i in range(self.anatomical.ndim):
-            self.FD.direction = i
-            self.FD.voxel_sizes = self.voxel_size[i]
-            anat_list.append(self.FD.direct(self.anatomical))
-        self.anatomical_grad = np.stack(anat_list, axis=-1)
-
     def direct(self, x):
-        res = []
-        for i in range(x.ndim):
-            self.FD.direction = i
-            self.FD.voxel_sizes = self.voxel_size[i]
-            res.append(self.FD.direct(x))
+        if self.gpu and isinstance(x, np.ndarray):
+            x = torch.tensor(x)
+        gradient = self.gradient.direct(x)
+        res =  self.directional_op(gradient, self.anatomical_grad, self.gamma, self.eta)
         if self.gpu:
-            res = jnp.stack(res, axis=-1)
-            return device_get(self.directional_op(res, self.anatomical_grad, self.gamma, self.eta))
+            return res.numpy() if self.numpy_out else res
         else:
-            res = np.stack(res, axis=-1)
-            return device_get(self.directional_op(res, self.anatomical_grad, self.gamma, self.eta))
+            return res
         
     def adjoint(self, x):
+        if self.gpu and isinstance(x, np.ndarray):
+            x = torch.tensor(x)
         x = self.directional_op(x, self.anatomical_grad, self.gamma, self.eta)
-        res = []
-        for i in range(x.ndim-1):
-            self.FD.direction = i
-            self.FD.voxel_sizes = self.voxel_size[i]
-            res.append(device_get(self.FD.adjoint(x[..., i])))
-        if self.numpy_out:
-            res = device_get(res)
-        return -sum(res)
-    
-
-    
-class GPUFiniteDifferenceOperator(Operator):
-
-    """
-    JAX implementation of finite difference operator
-    """
-    
-    def __init__(self, voxel_sizes, direction=None, method='forward', bnd_cond='Neumann', numpy=True):
-        self.voxel_sizes= voxel_sizes
-        self.direction = direction
-        self.method = method
-        self.boundary_condition = bnd_cond
-
-        self.numpy = numpy # whether to return numpy array or jax array
-        
-        if self.voxel_sizes<= 0:
-            raise ValueError('Need a positive voxel size')
-
-    def get_slice(self, x, start, stop, end=None):
-        tmp = [slice(None)] * x.ndim
-        tmp[self.direction] = slice(start, stop, end)
-        return tmp
-
-    def direct(self, x):
-        outa = jnp.zeros_like(x) if self.numpy else x
-
-        if self.method == 'forward':
-            outa = outa.at[tuple(self.get_slice(x, 1, -1))].set(jnp.subtract(x[tuple(self.get_slice(x, 2, None))], x[tuple(self.get_slice(x, 1, -1))]))
-            if self.boundary_condition == 'Neumann':
-                outa = outa.at[tuple(self.get_slice(x, 0, 1))].set(jnp.subtract(x[tuple(self.get_slice(x, 1, 2))], x[tuple(self.get_slice(x, 0, 1))]))
-            elif self.boundary_condition == 'Periodic':
-                outa = outa.at[tuple(self.get_slice(x, 0, 1))].set(jnp.subtract(x[tuple(self.get_slice(x, 1, 2))], x[tuple(self.get_slice(x, -1, None))]))
-                outa = outa.at[tuple(self.get_slice(x, -1, None))].set(jnp.subtract(x[tuple(self.get_slice(x, 0, 1))], x[tuple(self.get_slice(x, -2, -1))]))
-            else:
-                raise ValueError('Not implemented')
-
-        elif self.method == 'backward':
-            outa = outa.at[tuple(self.get_slice(x, 1, -1))].set(jnp.subtract(x[tuple(self.get_slice(x, 1, -1))], x[tuple(self.get_slice(x, 0, -2))]))
-            if self.boundary_condition == 'Neumann':
-                outa = outa.at[tuple(self.get_slice(x, -1, None))].set(jnp.subtract(x[tuple(self.get_slice(x, -1, None))], x[tuple(self.get_slice(x, -2, -1))]))
-            elif self.boundary_condition == 'Periodic':
-                outa = outa.at[tuple(self.get_slice(x, 0, 1))].set(jnp.subtract(x[tuple(self.get_slice(x, -1, None))], x[tuple(self.get_slice(x, 0, 1))]))
-                outa = outa.at[tuple(self.get_slice(x, -1, None))].set(jnp.subtract(x[tuple(self.get_slice(x, -1, None))], x[tuple(self.get_slice(x, -2, -1))]))
-            else:
-                raise ValueError('Not implemented')
-
-        elif self.method == 'central':
-            outa = outa.at[tuple(self.get_slice(x, 1, -1))].set(jnp.subtract(x[tuple(self.get_slice(x, 2, None))], x[tuple(self.get_slice(x, 0, -2))]) / 2)
-            if self.boundary_condition == 'Neumann':
-                outa = outa.at[tuple(self.get_slice(x, 0, 1))].set(jnp.add(x[tuple(self.get_slice(x, 1, 2))], x[tuple(self.get_slice(x, 0, 1))]) / 2)
-                outa = outa.at[tuple(self.get_slice(x, -1, None))].set(jnp.add(x[tuple(self.get_slice(x, -1, None))], x[tuple(self.get_slice(x, -2, -1))]) / -2)
-            elif self.boundary_condition == 'Periodic':
-                outa = outa.at[tuple(self.get_slice(x, 0, 1))].set(jnp.subtract(x[tuple(self.get_slice(x, 1, 2))], x[tuple(self.get_slice(x, -1, None))]) / 2)
-                outa = outa.at[tuple(self.get_slice(x, -1, None))].set(jnp.subtract(x[tuple(self.get_slice(x, 0, 1))], x[tuple(self.get_slice(x, -2, -1))]) / 2)
-            else:
-                raise ValueError('Not implemented')
-
+        res = self.gradient.adjoint(x)
+        if self.gpu:
+            return res.numpy() if self.numpy_out else res
         else:
-            raise ValueError('Not implemented')
+            return res
 
-        if self.voxel_sizes!= 1.0:
-            outa /= self.voxel_sizes
-
-        del x
-
-        return device_get(outa) if self.numpy else outa
-
-    def adjoint(self, x):
-        outa = jnp.zeros_like(x) if self.numpy else x
-
-        if self.method == 'forward':
-            outa = outa.at[tuple(self.get_slice(x, 1, -1))].set(jnp.subtract(x[tuple(self.get_slice(x, 1, -1))], x[tuple(self.get_slice(x, 0, -2))]))
-            if self.boundary_condition == 'Neumann':
-                outa = outa.at[tuple(self.get_slice(x, 0, 1))].set(x[tuple(self.get_slice(x, 0, 1))])
-                outa = outa.at[tuple(self.get_slice(x, -1, None))].set(-x[tuple(self.get_slice(x, -2, -1))])
-            elif self.boundary_condition == 'Periodic':
-                outa = outa.at[tuple(self.get_slice(x, 0, 1))].set(jnp.subtract(x[tuple(self.get_slice(x, 0, 1))], x[tuple(self.get_slice(x, -1, None))]))
-                outa = outa.at[tuple(self.get_slice(x, -1, None))].set(jnp.subtract(x[tuple(self.get_slice(x, -1, None))], x[tuple(self.get_slice(x, -2, -1))]))
-            else:
-                raise ValueError('Not implemented')
-
-        elif self.method == 'backward':
-            outa = outa.at[tuple(self.get_slice(x, 1, -1))].set(jnp.subtract(x[tuple(self.get_slice(x, 2, None))], x[tuple(self.get_slice(x, 1, -1))]))
-            if self.boundary_condition == 'Neumann':
-                outa = outa.at[tuple(self.get_slice(x, 0, 1))].set(x[tuple(self.get_slice(x, 1, 2))])
-                outa = outa.at[tuple(self.get_slice(x, -1, None))].set(-x[tuple(self.get_slice(x, -1, None))])
-            elif self.boundary_condition == 'Periodic':
-                outa = outa.at[tuple(self.get_slice(x, 0, 1))].set(jnp.subtract(x[tuple(self.get_slice(x, 1, 2))], x[tuple(self.get_slice(x, 0, 1))]))
-                outa = outa.at[tuple(self.get_slice(x, -1, None))].set(jnp.subtract(x[tuple(self.get_slice(x, 0, 1))], x[tuple(self.get_slice(x, -1, None))]))
-            else:
-                raise ValueError('Not implemented')
-        elif self.method == 'central':
-            # interior points
-            outa = outa.at[tuple(self.get_slice(x, 1, -1))].set(
-                jnp.subtract(x[tuple(self.get_slice(x, 2, None))], 
-                             x[tuple(self.get_slice(x, 0, -2))]) /2)
-            if self.boundary_condition == 'Neumann':
-                # left boundary
-                outa = outa.at[tuple(self.get_slice(x, 0, 1))].set(
-                    jnp.subtract(x[tuple(self.get_slice(x, 1, 2))], 
-                            x[tuple(self.get_slice(x, 0, 1))]) / 2)
-                # right boundary
-                outa = outa.at[tuple(self.get_slice(x, -1, None))].set(
-                    jnp.subtract(x[tuple(self.get_slice(x, -1, None))], 
-                            x[tuple(self.get_slice(x, -2, -1))]) / 2)
-            elif self.boundary_condition == 'Periodic':
-                # left boundary
-                outa = outa.at[tuple(self.get_slice(x, 0, 1))].set(
-                    jnp.subtract(x[tuple(self.get_slice(x, 1, 2))], 
-                                 x[tuple(self.get_slice(x, -1, None))]) / 2)
-                # right boundary
-                outa = outa.at[tuple(self.get_slice(x, -1, None))].set(
-                    jnp.subtract(x[tuple(self.get_slice(x, 0, 1))], 
-                                 x[tuple(self.get_slice(x, -2, -1))]) / 2)
-            
-        else:
-            raise ValueError('Not implemented')
-        
-        if self.voxel_sizes!= 1.0:
-            outa /= self.voxel_sizes
-
-        del x
-
-        return device_get(outa) if self.numpy else outa
     
+
 
 class CPUFiniteDifferenceOperator(Operator):
 
@@ -387,7 +291,7 @@ class CPUFiniteDifferenceOperator(Operator):
         self.voxel_sizes= voxel_sizes
         self.direction = direction
         self.method = method
-        self.boundary_condition = bnd_cond
+        self.bnd_cond = bnd_cond
         
         if self.voxel_sizes<= 0:
             raise ValueError('Need a positive voxel size')
@@ -413,7 +317,7 @@ class CPUFiniteDifferenceOperator(Operator):
                              x[tuple(self.get_slice(x, 1,-1))], \
                              out = outa[tuple(self.get_slice(x, 1, -1))])               
 
-            if self.boundary_condition == 'Neumann':
+            if self.bnd_cond == 'Neumann':
                 
                 # left boundary
                 np.subtract(x[tuple(self.get_slice(x, 1,2))],\
@@ -421,7 +325,7 @@ class CPUFiniteDifferenceOperator(Operator):
                             out = outa[tuple(self.get_slice(x, 0,1))]) 
                 
                 
-            elif self.boundary_condition == 'Periodic':
+            elif self.bnd_cond == 'Periodic':
                 
                 # left boundary
                 np.subtract(x[tuple(self.get_slice(x, 1,2))],\
@@ -447,14 +351,14 @@ class CPUFiniteDifferenceOperator(Operator):
                              x[tuple(self.get_slice(x, 0,-2))], \
                              out = outa[tuple(self.get_slice(x, 1, -1))])              
             
-            if self.boundary_condition == 'Neumann':
+            if self.bnd_cond == 'Neumann':
                     
                     # right boundary
                     np.subtract( x[tuple(self.get_slice(x, -1, None))], \
                                  x[tuple(self.get_slice(x, -2,-1))], \
                                  out = outa[tuple(self.get_slice(x, -1, None))]) 
                     
-            elif self.boundary_condition == 'Periodic':
+            elif self.bnd_cond == 'Periodic':
                   
                 # left boundary
                 np.subtract(x[tuple(self.get_slice(x, 0,1))],\
@@ -483,7 +387,7 @@ class CPUFiniteDifferenceOperator(Operator):
             
             outa[tuple(self.get_slice(x, 1, -1))] /= 2.
             
-            if self.boundary_condition == 'Neumann':
+            if self.bnd_cond == 'Neumann':
                             
                 # left boundary
                 np.subtract( x[tuple(self.get_slice(x, 1, 2))], \
@@ -497,7 +401,7 @@ class CPUFiniteDifferenceOperator(Operator):
                                  out = outa[tuple(self.get_slice(x, -1, None))])
                 outa[tuple(self.get_slice(x, -1, None))] /=2.                
                 
-            elif self.boundary_condition == 'Periodic':
+            elif self.bnd_cond == 'Periodic':
                 pass
                 
                # left boundary
@@ -543,7 +447,7 @@ class CPUFiniteDifferenceOperator(Operator):
                              x[tuple(self.get_slice(x, 0,-2))], \
                              out = outa[tuple(self.get_slice(x, 1, -1))])              
             
-            if self.boundary_condition == 'Neumann':            
+            if self.bnd_cond == 'Neumann':            
 
                 # left boundary
                 outa[tuple(self.get_slice(x, 0,1))] = x[tuple(self.get_slice(x, 0,1))]                
@@ -551,7 +455,7 @@ class CPUFiniteDifferenceOperator(Operator):
                 # right boundary
                 outa[tuple(self.get_slice(x, -1,None))] = - x[tuple(self.get_slice(x, -2,-1))]  
                 
-            elif self.boundary_condition == 'Periodic':            
+            elif self.bnd_cond == 'Periodic':            
 
                 # left boundary
                 np.subtract(x[tuple(self.get_slice(x, 0,1))],\
@@ -576,7 +480,7 @@ class CPUFiniteDifferenceOperator(Operator):
                              x[tuple(self.get_slice(x, 1,-1))], \
                              out = outa[tuple(self.get_slice(x, 1, -1))])             
             
-            if self.boundary_condition == 'Neumann':             
+            if self.bnd_cond == 'Neumann':             
                 
                 # left boundary
                 outa[tuple(self.get_slice(x, 0,1))] = x[tuple(self.get_slice(x, 1,2))]                
@@ -585,7 +489,7 @@ class CPUFiniteDifferenceOperator(Operator):
                 outa[tuple(self.get_slice(x, -1,None))] = - x[tuple(self.get_slice(x, -1,None))] 
                 
                 
-            elif self.boundary_condition == 'Periodic':
+            elif self.bnd_cond == 'Periodic':
             
                 # left boundary
                 np.subtract(x[tuple(self.get_slice(x, 1,2))],\
@@ -614,7 +518,7 @@ class CPUFiniteDifferenceOperator(Operator):
             outa[tuple(self.get_slice(x, 1, -1))] /= 2.0
             
 
-            if self.boundary_condition == 'Neumann':
+            if self.bnd_cond == 'Neumann':
                 
                 # left boundary
                 np.add(x[tuple(self.get_slice(x, 0,1))],\
@@ -630,7 +534,7 @@ class CPUFiniteDifferenceOperator(Operator):
                 outa[tuple(self.get_slice(x, -1,None))] /= -2.0               
                                                             
                 
-            elif self.boundary_condition == 'Periodic':
+            elif self.bnd_cond == 'Periodic':
                 
                 # left boundary
                 np.subtract(x[tuple(self.get_slice(x, 1,2))],\
@@ -677,16 +581,16 @@ def directional_op(image_gradient, anatomical_gradient, gamma=1, eta=1e-6):
                 out[d,h,w] = (image_gradient[d,h,w] - gamma * np.dot(image_gradient[d,h,w], xi) * xi)
     return out
 
-@jjit
 def gpu_directional_op(image_gradient, anatomical_gradient, gamma=1, eta=1e-6):
     """
-    Calculate the directional operator of a 3D image optimized with jax JIT
+    Calculate the directional operator of a 3D image optimized with torch
     image_gradient: 3D array of image gradients
     anatomical_gradient: 3D array of anatomical gradients
     """
 
-    xi = anatomical_gradient / (jnp.sqrt(jnp.sum(anatomical_gradient**2, axis=-1, keepdims=True)) + eta**2)
-    out = image_gradient - gamma * jnp.sum(image_gradient * xi, axis=-1, keepdims=True) * xi
+    xi = anatomical_gradient / (torch.norm(anatomical_gradient, p=2, dim=-1, keepdim=True) + eta**2)
+
+    out = image_gradient - gamma * torch.sum(image_gradient * xi, dim=-1, keepdim=True) * xi
     return out
 
 @jit(forceobj=True)

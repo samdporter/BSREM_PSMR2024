@@ -1,152 +1,352 @@
-import os
-import sys
-import subprocess
+import torch
+from torch import vmap
+import numpy as np
 
-# Set the environment variable
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".2"
+from .Function import Function
 
-from Function import Function
-from jax import jit, vmap, device_get
-import jax.numpy as jnp
+def pseudo_inverse_torch(H):
+    """Inverse except when element is zero."""
+    return torch.where(H != 0, 1/H, torch.tensor(0.0, device=H.device, dtype=H.dtype)) 
 
+def eigenvalues_2x2_torch(H):
+    assert H.shape == (2, 2)
+    a, b, c, d = H[..., 0, 0], H[..., 0, 1], H[..., 1, 0], H[..., 1, 1]
+    trace = a + d
+    determinant = a * d - b * c
+    
+    # Add a small epsilon to avoid numerical instability in sqrt
+    epsilon = torch.finfo(torch.float32).tiny
+    discriminant = trace**2 - 4 * determinant
+    discriminant = torch.where(discriminant < 0, torch.zeros_like(discriminant), discriminant)
+    
+    eigenvalue1 = (trace + torch.sqrt(discriminant + epsilon)) / 2
+    eigenvalue2 = (trace - torch.sqrt(discriminant + epsilon)) / 2
+    
+    # Set very small negative eigenvalues to zero
+    eigenvalue1 = torch.where(eigenvalue1 < 0, torch.zeros_like(eigenvalue1), eigenvalue1)
+    eigenvalue2 = torch.where(eigenvalue2 < 0, torch.zeros_like(eigenvalue2), eigenvalue2)
+    
+    return torch.stack([eigenvalue1, eigenvalue2], dim=-1)
 
+def cardano_cubic_roots_torch(a, b, c, d):
+    # Coefficients for the depressed cubic equation
+    p = (3 * a * c - b ** 2) / (3 * a ** 2)
+    q = (2 * b ** 3 - 9 * a * b * c + 27 * a ** 2 * d) / (27 * a ** 3)
 
-@jit
-def singular_vals(A):
-    return jnp.linalg.svd(A, compute_uv=False)
+    # Discriminant of the cubic equation
+    discriminant = (q / 2) ** 2 + (p / 3) ** 3
 
-@jit
-def sum_singular(A, eps):
-    return jnp.sum(singular_vals(A))
+    # Add epsilon to avoid numerical issues
+    epsilon = torch.finfo(torch.float32).tiny
+    discriminant = discriminant + epsilon
 
-@jit
-def sum_singular_fair(A, eps):
-    s = singular_vals(A)
-    return jnp.sum(eps * (s/eps - jnp.log(1 + s/eps)))
+    r = torch.sqrt(torch.abs(-(p / 3) ** 3))
+    theta = torch.acos(torch.clamp(-q / (2 * r), -1.0, 1.0))  # Clamp the argument of acos to avoid NaN
 
-@jit
-def singular(A):
-    return jnp.linalg.svd(A, compute_uv=True, full_matrices=False)
+    # Calculate the roots using Cardano's formula
+    root1 = 2 * torch.pow(r, 1/3) * torch.cos(theta / 3) - b / (3 * a)
+    root2 = 2 * torch.pow(r, 1/3) * torch.cos((theta + 2 * np.pi) / 3) - b / (3 * a)
+    root3 = 2 * torch.pow(r, 1/3) * torch.cos((theta + 4 * np.pi) / 3) - b / (3 * a)
 
-@jit
-def fair_gradient(x, eps):
-    return x / (eps + jnp.sqrt(x**2))
+    roots = torch.stack([root1, root2, root3], dim=-1)
+    return torch.sort(roots).values
 
-@jit
-def nuc_norm_gradient(x, eps):
-    u, s, vt = singular(x)
-    s = fair_gradient(s, eps)
-    return u @ jnp.diag(s) @ vt
+def eigenvalues_3x3_torch(H):
+    assert H.shape == (3, 3)
+    a = torch.tensor(1.0, dtype=H.dtype, device=H.device)
+    b = -torch.trace(H)
+    c = 0.5 * (torch.trace(H)**2 - torch.trace(H @ H))
+    d = -torch.det(H)
+    eigenvalues = cardano_cubic_roots_torch(a, b, c, d)
+    # Replace NaNs with zeros
+    eigenvalues = torch.where(torch.isnan(eigenvalues), torch.zeros_like(eigenvalues), eigenvalues)
+    # if very small eigenvalues are negative, set them to zero
+    eigenvalues = torch.where(eigenvalues < 0, torch.zeros_like(eigenvalues), eigenvalues)
+    return eigenvalues
 
-@jit
-def nuc_norm_proximal(x, tau):
-    u, s, vt = singular(x)
-    s = jnp.sign(s) * jnp.maximum(jnp.abs(s) - tau, 0)
-    return u @ jnp.diag(s) @ vt
+def eigenvectors_2x2_torch(H, eigenvalues):
+    # Use torch.where to handle the case where eigenvalues are very close
+    condition = torch.abs(eigenvalues[0] - eigenvalues[1]) < 1e-6
+    e1_default = torch.tensor([1, 0], dtype=torch.float32)
+    e2_default = torch.tensor([0, 1], dtype=torch.float32)
 
-@jit
-def nuc_norm_convex_conjugate(x):
-    u, s, vt = singular(x)
-    # projection of max norm to unit ball
-    return jnp.max(jnp.minimum(1, s))
+    # Extract elements from the matrix
+    a = H[0, 0]
+    b = H[0, 1]
+    c = H[1, 0]
+    d = H[1, 1]
+
+    # Handle the case where b or c (off-diagonal elements) might be zero
+    bc_zero_condition = (b == 0) & (c == 0)
+    
+    # Calculate the eigenvectors
+    e1_custom = torch.stack([eigenvalues[0] - d, b])
+    e2_custom = torch.stack([eigenvalues[1] - d, b])
+    
+    e1 = torch.where(condition | bc_zero_condition, e1_default, e1_custom)
+    e2 = torch.where(condition | bc_zero_condition, e2_default, e2_custom)
+
+    # Normalize the eigenvectors
+    e1norm = torch.norm(e1)
+    e2norm = torch.norm(e2)
+
+    e1 = torch.where(e1norm == 0, e1_default, e1 / e1norm)
+    e2 = torch.where(e2norm == 0, e2_default, e2 / e2norm)
+
+    return torch.stack([e1, e2], dim=-1)
+
+def compute_special_eigenvector(mu):
+    v_i = torch.stack([torch.ones_like(mu), -mu, torch.zeros_like(mu)], dim=-1)
+    norm = torch.sqrt(1 + mu ** 2)
+    v_i = v_i / norm.unsqueeze(-1)
+    return v_i
+
+def eigenvectors_3x3_torch(A, eigenvalues):
+    I = torch.eye(3, dtype=A.dtype, device=A.device)
+    eigenvectors = []
+    default_eigenvectors = torch.eye(3, dtype=A.dtype, device=A.device)
+
+    for i, eigenvalue in enumerate(eigenvalues):
+        M = A - eigenvalue * I
+
+        # Compute the norms of the columns of M
+        norms = torch.norm(M, dim=0)
+        min_norm = torch.min(norms)
+
+        # Mask for the minimum norm column
+        min_norm_mask = norms == min_norm
+
+        # Special eigenvector calculation
+        e1 = M[:, 0]
+        e2 = M[:, 1]
+
+        mu = (e2[0] / (e2[1] + torch.finfo(e2.dtype).eps))  # Avoid division by zero
+        special_eigenvector = compute_special_eigenvector(mu)
+
+        # Compute the cross product of the first two columns of M
+        cross_product = torch.cross(e1, e2)
+        cross_norm = torch.norm(cross_product)
+
+        # Check if e1 and e2 are multiples of each other
+        multiples_condition = cross_norm < 1e-6
+
+        # Use torch.where to select the correct eigenvector
+        eigenvector = torch.where(multiples_condition.unsqueeze(0), special_eigenvector.unsqueeze(0), cross_product.unsqueeze(0) / (cross_norm + 1e-8)).squeeze(0)
+
+        # Default eigenvector corresponding to the column with the minimum norm
+        default_eigenvector = torch.sum(default_eigenvectors * min_norm_mask.unsqueeze(0), dim=1)
+
+        # Handle the case where all values are zero
+        min_norm_zero_mask = min_norm < 1e-6
+        eigenvector = torch.where(min_norm_zero_mask.unsqueeze(-1), default_eigenvector, eigenvector)
+
+        eigenvectors.append(eigenvector)
+
+    return torch.stack(eigenvectors, dim=-1)
+
+def l1_norm_torch(x):
+    return torch.sum(torch.abs(x))
+
+def l1_norm_prox_torch(x, tau):
+    return torch.sign(x) * torch.clamp(torch.abs(x) - tau, min=0)
+
+def l2_norm_torch(x):
+    return torch.sqrt(torch.sum(x**2))
+
+def l2_norm_prox_torch(x, tau):
+    return x / torch.maximum(1, l2_norm_torch(x) / tau)
+
+def charbonnier_torch(x, eps):
+    return torch.sqrt(x**2 + eps**2) - eps
+
+def charbonnier_grad_torch(x, eps):
+    return x / torch.sqrt(x**2 + eps**2)
+
+def fair_torch(x, eps):
+    return eps * (torch.abs(x) / eps - torch.log(1 + torch.abs(x) / eps))
+
+def fair_grad_torch(x, eps):
+    return x / (eps + torch.abs(x))
+
+def perona_malik_torch(x, eps):
+    return eps/2 * (1 - torch.exp(-x**2 / eps**2))
+
+def perona_malik_grad_torch(x, eps):
+    return x * torch.exp(-x**2 / eps**2) / eps**2
+
+def nothing_torch(x, eps=0):
+    return x
+
+def nothing_grad_torch(x, eps=0):
+    return 1
+
+def norm_torch(M, func, smoothing_func, order, eps):
+
+    if order == 0:
+        H = M.T @ M
+    elif order == 1:
+        H = M @ M.T
+    else:
+        raise ValueError("Invalid order")
+
+    if H.shape == (2, 2):
+        eigenvalues = eigenvalues_2x2_torch(H)
+    elif H.shape == (3, 3):
+        eigenvalues = eigenvalues_3x3_torch(H)[1:]
+
+    singularvalues = torch.sqrt(eigenvalues)
+    singularvalues = smoothing_func(singularvalues, eps)
+    return func(singularvalues)
+
+def norm_func_torch_xxt(X, func, tau):
+
+    H = X@X.T
+
+    if H.shape == (2,2):
+        S_square = eigenvalues_2x2_torch(H)
+        U = eigenvectors_2x2_torch(H, S_square)
+    elif H.shape == (3,3):
+        S_square = eigenvalues_3x3_torch(H)
+        U = eigenvectors_3x3_torch(H, S_square)
+    else:
+        raise ValueError(f"Matrix size {H.shape} not supported")
+
+    S = torch.sqrt(S_square)
+    S_inv = pseudo_inverse_torch(S)
+    S_func = func(S, tau)
+
+    # Reconstruct the result matrix
+    return U @ torch.diag(S_func) @ torch.diag(S_inv) @ U.T @ X
+
+def norm_func_torch_xtx(X, func, tau):
+
+    H = X.T@X
+
+    if H.shape == (2,2):
+        S_square = eigenvalues_2x2_torch(H)
+        V = eigenvectors_2x2_torch(H, S_square)
+    elif H.shape == (3,3):
+        S_square = eigenvalues_3x3_torch(H)
+        V = eigenvectors_3x3_torch(H, S_square)
+    else:
+        raise ValueError(f"Matrix size {H.shape} not supported")
+
+    S = torch.sqrt(S_square)
+    S_inv = pseudo_inverse_torch(S)
+    S_func = func(S, tau)
+
+    # Reconstruct the result matrix
+    return X @ V @ torch.diag(S_inv) @ torch.diag(S_func)  @ V.T
+
+def norm_func_torch(X, func, tau, order=0):
+
+    if order == 0:
+        return norm_func_torch_xtx(X, func, tau)
+    elif order == 1:
+        return norm_func_torch_xxt(X, func, tau)
+    else:
+        raise ValueError("Invalid order")
+
+def vectorised_norm(A, func, smoothing_func, order=0, eps=0):
+    def ordered_norm(A):
+        return norm_torch(A, func, smoothing_func, order, eps)
+
+    # Apply vmap across the last two dimensions
+    return vmap(vmap(vmap(ordered_norm, in_dims=0), in_dims=0), in_dims=0)(A)
+
+def vectorised_norm_func(A, func, tau, order=0):
+
+    def norm_prox_element(M):
+        return norm_func_torch(M, func, tau, order)
+
+    return vmap(vmap(vmap(norm_prox_element, in_dims=0), in_dims=0), in_dims=0)(A)
 
 class GPUVectorialTotalVariation(Function):
-    def __init__(self, num_batches=3, eps=1e-8, smoothing_function=None):        
+    """ 
+    GPU implementation of the vectorial total variation function.
+    """
+    def __init__(self, eps=0, norm = 'nuclear', order=None, smoothing_function=None, numpy_out=False):        
 
-        self.num_batches = num_batches
+        """Initializes the GPUVectorialTotalVariation class.
+        """        
+
         self.eps = eps
+        self.norm = norm
+        self.order = order
         self.smoothing_function = smoothing_function
+        self.numpy_out = numpy_out
+
+    def direct(self, x):
+
+        if isinstance(x, np.ndarray):
+            x = torch.tensor(x)
+
+        # order defined by smallest of the last two dimensions
+        if self.order is None:
+            order = 1 if x.shape[-2] <= x.shape[-1] else 0
+        else:
+            order = self.order
+
+        if self.norm == 'nuclear':
+            norm_func = l1_norm_torch
+        elif self.norm == 'frobenius':
+            norm_func = l2_norm_torch
+        else:
+            raise ValueError('Norm not defined')
+
+        if self.smoothing_function == 'fair':
+            smoothing_func = fair_torch
+        elif self.smoothing_function == 'charbonnier':
+            smoothing_func = charbonnier_torch
+        elif self.smoothing_function == 'perona_malik':
+            smoothing_func = perona_malik_torch
+        else:
+            smoothing_func = nothing_torch
+
+        return vectorised_norm(x, norm_func, smoothing_func, order, self.eps)
 
     def __call__(self, x):
 
-        # Flatten the first three dimensions
-        original_shape = x.shape
-        x = x.reshape(-1, original_shape[-2], original_shape[-1])
+        return torch.sum(self.direct(x)).numpy()
 
-        total_elements = x.shape[0]
-        batch_size = int(jnp.ceil(total_elements / self.num_batches))
-        result = 0
-
-        if self.smoothing_function == 'fair':
-            sum_func = sum_singular_fair
-        else:
-            sum_func = sum_singular
-
-        for i in range(self.num_batches):
-            print(f'Batch {i+1}/{self.num_batches}')
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, total_elements)
-            batch = x[start_idx:end_idx]
-            eps_arr = jnp.ones(batch.shape[0]) * self.eps
-            result += jnp.sum(vmap(sum_func)(batch, eps_arr))
-
-        return device_get(result)
-    
     def proximal(self, x, tau):
 
-        if self.smoothing_function != None:
-            raise ValueError('Cannot use proximal operator with smoothing function')
-        
-        # Flatten the first three dimensions
-        original_shape = x.shape
-        x = x.reshape(-1, original_shape[-2], original_shape[-1])
+        if isinstance(x, np.ndarray):
+            x = torch.tensor(x)
 
-        total_elements = x.shape[0]
-        batch_size = int(jnp.ceil(total_elements / self.num_batches))
-        result = []
+        # order defined by smallest of the last two dimensions
+        if self.order is None:
+            order =1 if x.shape[-2] <= x.shape[-1] else 0
+        else:
+            order = self.order
 
-        for i in range(self.num_batches):
-            print(f'Batch {i+1}/{self.num_batches}')
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, total_elements)
-            batch = x[start_idx:end_idx]
-            tau_arr = jnp.ones(batch.shape[0]) * tau
-            result.append(vmap(nuc_norm_proximal)(batch, tau_arr))
+        if self.norm == 'nuclear':
+            norm_func = l1_norm_prox_torch
+        elif self.norm == 'frobenius':
+            norm_func = l2_norm_prox_torch
+        else:
+            raise ValueError('Norm not defined')
 
-        return jnp.concatenate(result, axis=0).reshape(original_shape)
-    
+        return vectorised_norm_func(x, norm_func, tau, order).numpy() if self.numpy_out else vectorised_norm_func(x, norm_func, tau, order)
+
     def gradient(self, x):
 
-        if self.smoothing_function == None:
+        if isinstance(x, np.ndarray):
+            x = torch.tensor(x)
+
+        # order defined by smallest of the last two dimensions
+        if self.order is None:
+            order =1 if x.shape[-2] <= x.shape[-1] else 0
+        else:
+            order = self.order
+
+        if self.smoothing_function == 'fair':
+            smoothing_func = fair_grad_torch
+        elif self.smoothing_function == 'charbonnier':
+            smoothing_func = charbonnier_grad_torch
+        elif self.smoothing_function == 'perona_malik':
+            smoothing_func = perona_malik_grad_torch
+        else:
             raise ValueError('Smoothing function not defined')
 
-        original_shape = x.shape
-        x = x.reshape(-1, original_shape[-2], original_shape[-1])
-
-        total_elements = x.shape[0]
-        batch_size = int(jnp.ceil(total_elements / self.num_batches))
-        result = []
-
-        for i in range(self.num_batches):
-            print(f'Batch {i+1}/{self.num_batches}')
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, total_elements)
-            batch = x[start_idx:end_idx]
-            eps_arr = jnp.ones(batch.shape[0]) * self.eps
-            result.append(vmap(nuc_norm_gradient)(batch, eps_arr))
-        
-        return jnp.concatenate(result, axis=0).reshape(original_shape)
-    
-    def convex_conjugate(self, x):
-
-        if self.smoothing_function != None:
-            raise ValueError('Cannot use convex conjugate with smoothing function')
-
-        original_shape = x.shape
-        x = x.reshape(-1, original_shape[-2], original_shape[-1])
-
-        total_elements = x.shape[0]
-        batch_size = int(jnp.ceil(total_elements / self.num_batches))
-        result = 0
-
-        for i in range(self.num_batches):
-            print(f'Batch {i+1}/{self.num_batches}')
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, total_elements)
-            batch = x[start_idx:end_idx]
-            result += jnp.sum(vmap(nuc_norm_convex_conjugate)(batch))
-
-        return device_get(result)
-
-
-
+        return vectorised_norm_func(x, smoothing_func, self.eps, order).numpy() if self.numpy_out else vectorised_norm_func(x, smoothing_func, self.eps, order)

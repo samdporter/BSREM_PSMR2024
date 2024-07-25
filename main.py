@@ -7,6 +7,11 @@ import pandas as pd
 from numbers import Number
 import shutil
 
+# print pythonpath with lots of space around it ==
+print("\n\n")
+print(sys.path)
+print("\n\n")
+
 # import gaussian filter
 from scipy.ndimage import gaussian_filter
 
@@ -32,16 +37,18 @@ parser.add_argument('--modality', type=str, default='both', help='modality - can
 parser.add_argument('--alpha', type=float, default=256, help='alpha')
 parser.add_argument('--beta', type=float, default=1, help='beta')
 parser.add_argument('--delta', type=float, default=1e-6, help='delta')
-parser.add_argument('--num_subsets', type=int, default=12, help='number of subsets')
+# num_subsets can be an integer or a string of two integers separated by a comma
+parser.add_argument('--num_subsets', type=str, default="12", help='number of subsets')
+
 
 parser.add_argument('--iterations', type=int, default=240, help='max iterations')
 parser.add_argument('--update_interval', type=int, default=12, help='update interval')
 parser.add_argument('--relaxation_eta', type=float, default=0.1, help='relaxation eta')
 
 parser.add_argument('--data_path', type=str, default="/home/sam/data/phantom_data/for_cluster/", help='data path')
-parser.add_argument('--output_path', type=str, default="/home/sam/working/BSREM_PSMR2024/results/test", help='output path')
-parser.add_argument('--source_path', type=str, default='/home/sam/working/BSREM_PSMR2024/src', help='source path')
-parser.add_argument('--working_path', type=str, default='/home/sam/working/BSREM_PSMR2024/tmp', help='working path')
+parser.add_argument('--output_path', type=str, default="/home/sam/working/BSREM_PSMR_MIC_2024/results/test", help='output path')
+parser.add_argument('--source_path', type=str, default='/home/sam/working/BSREM_PSMR_MIC_2024/src', help='source path')
+parser.add_argument('--working_path', type=str, default='/home/sam/working/BSREM_PSMR_MIC_2024/tmp', help='working path')
 parser.add_argument('--save_images', type=bool, default=True, help='save images')
 
 # set numpy seed - None if not set
@@ -49,6 +56,7 @@ parser.add_argument('--seed', type=int, default=None, help='numpy seed')
 
 parser.add_argument('--stochastic', action='store_true', help='Enables stochastic processing')
 parser.add_argument('--svrg', action='store_true', help='Enables SVRG')
+parser.add_argument('--saga', action='store_true', help='Enables SAGA')
 parser.add_argument('--with_replacement', action='store_true', help='Enables replacement')
 parser.add_argument('--single_modality_update', action='store_true', help='Enables single modality update')
 parser.add_argument('--prior_is_subset', action='store_true', help='Sets prior as subset')
@@ -162,8 +170,8 @@ def get_objective_function(data, acq_model, initial_image, num_subsets):
     return obj_fun
 
 def get_vectorial_tv(bo, ct, alpha, beta, initial_estimates, delta, gpu=False):
-    vtv = create_vectorial_total_variation(smoothing_function='fair', eps=delta, gpu=False)
-    jac = NumpyBlockDataContainer(bo.direct(initial_estimates),Jacobian(anatomical=ct.as_array(), voxel_sizes=ct.voxel_sizes(), weights=[alpha, beta], gpu=False))
+    vtv = create_vectorial_total_variation(smoothing_function='fair', eps=delta, gpu=gpu)
+    jac = NumpyBlockDataContainer(bo.direct(initial_estimates),Jacobian(anatomical=ct.as_array(), voxel_sizes=ct.voxel_sizes(), weights=[alpha, beta], gpu=gpu))
     jac_co = CompositionOperator([bo, jac])
     jac_co.range_geometry = lambda: initial_estimates
     return OperatorCompositionFunction(vtv, jac_co)
@@ -179,6 +187,26 @@ def get_tv(operator, ct, regularisation_parameter, initial_estimate, delta):
 os.chdir(args.working_path)
 
 def main(args):
+
+    # if single_modality_update is False, num_subsets must be integer
+    if not args.single_modality_update:
+        try:
+            args.num_subsets = int(args.num_subsets)
+        except:
+            raise ValueError("num_subsets must be an integer if single_modality_update is False")
+    if isinstance(args.num_subsets, Number):
+        pet_num_subsets = int(args.num_subsets)
+        spect_num_subsets = int(args.num_subsets)
+    elif isinstance(args.num_subsets, str):
+        num_subsets = args.num_subsets
+        subset_list = num_subsets.split(",")
+        # if list is lenght one, set both to the same value
+        if len(subset_list) == 1:
+            pet_num_subsets = int(subset_list[0])
+            spect_num_subsets = int(subset_list[0])
+        else:
+            pet_num_subsets = int(subset_list[0])
+            spect_num_subsets = int(subset_list[1])
 
     cyl, gauss, = get_filters()
     ct = ImageData(os.path.join(args.data_path, "CT/ct_zoomed_pet.hv"))
@@ -199,7 +227,7 @@ def main(args):
         pet_am.direct = lambda x: pet_am.forward(x)
         pet_am.adjoint = lambda x: pet_am.backward(x)
         
-        pet_obj_fun = get_objective_function(pet_data["acquisition_data"], pet_am, pet_data["initial_image"], args.num_subsets)
+        pet_obj_fun = get_objective_function(pet_data["acquisition_data"], pet_am, pet_data["initial_image"], pet_num_subsets)
 
     if args.modality.lower() == "spect" or args.modality.lower() == "both":
 
@@ -214,7 +242,7 @@ def main(args):
         spect_am.direct = lambda x: spect_am.forward(x)
         spect_am.adjoint = lambda x: spect_am.backward(x)
         
-        spect_obj_fun = get_objective_function(spect_data["acquisition_data"], spect_am, spect_data["initial_image"], args.num_subsets)
+        spect_obj_fun = get_objective_function(spect_data["acquisition_data"], spect_am, spect_data["initial_image"], spect_num_subsets)
     
     if args.modality.lower() == "both":
         zero_pet2ct = ZeroOperator(pet_data["initial_image"], ct)
@@ -260,16 +288,16 @@ def main(args):
 
     if args.modality.lower() == "both":
         bsrem=BSREMmm_of(SIRFBlockFunction([pet_obj_fun, spect_obj_fun]), prior, 
-                         initial=initial, initial_step_size=2, relaxation_eta=args.relaxation_eta, 
+                         initial=initial, initial_step_size=1, relaxation_eta=args.relaxation_eta, 
                          update_objective_interval=args.update_interval, save_path=args.working_path,
-                         stochastic=args.stochastic, svrg=args.svrg, with_replacement=args.with_replacement,
+                         stochastic=args.stochastic, svrg=args.svrg, saga=args.saga, with_replacement=args.with_replacement,
                          single_modality_update=args.single_modality_update, save_images = args.save_images,
                          prior_is_subset=args.prior_is_subset, update_max=100*initial.max())
     else:
-        bsrem = BSREMmm_of(obj_fun, prior, initial=initial, initial_step_size=2, 
+        bsrem = BSREMmm_of(obj_fun, prior, initial=initial, initial_step_size=1, 
                            relaxation_eta=args.relaxation_eta, 
                            update_objective_interval=args.update_interval, save_path=args.working_path,
-                           stochastic=args.stochastic, svrg=args.svrg, with_replacement=args.with_replacement,
+                           stochastic=args.stochastic, svrg=args.svrg, saga=args.saga, with_replacement=args.with_replacement,
                            single_modality_update=False, save_images=args.save_images,
                            prior_is_subset=args.prior_is_subset, update_max=100*initial.max())
 
@@ -285,6 +313,10 @@ if __name__ == "__main__":
     # create dataframe of all args
     df_args = pd.DataFrame([vars(args)])
     df_args.to_csv(os.path.join(args.output_path, "args.csv"))
+
+    # print all args
+    for key, value in vars(args).items():
+        print(f"{key}: {value}")
 
     bsrem = main(args)
 

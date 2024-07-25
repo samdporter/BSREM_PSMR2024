@@ -13,34 +13,34 @@ import numpy as np
 
 from numba import njit, prange
 
-from jax import device_get
-import jax.numpy as jnp
+import torch
 
 ###########################
 ###### Functions ##########
 ###########################
 
-class JaxNumpyWrapper(Function):
+class TorchNumpyWrapper(Function):
 
     def __init__(self, function, shape):
         self.function = function
         self.shape = shape
 
     def forward(self, x):
-        x_jnp = jnp.reshape(x, self.shape)
-        res = self.function(x_jnp)
-        return device_get(res)
+        x_t = torch.tensor(x).reshape(self.shape)
+        res = self.function(x_t)
+        return res.numpy()
 
     def gradient(self, x):
-        x_jnp = jnp.reshape(x, self.shape)
-        res = self.function.gradient(x_jnp)
-        return device_get(res).flatten()
-    
+        x_t = torch.tensor(x).reshape(self.shape)
+        res = self.function.gradient(x_t)
+        return res.numpy().flatten()
+
     def hessian(self, x):
-        x_jnp = jnp.reshape(x, self.shape)
-        res = self.function.hessian(x_jnp)
-        return device_get(res).flatten()
-    
+        x_t = torch.tensor(x).reshape(self.shape)
+        res = self.function.hessian(x_t)
+        return res.numpy().flatten()
+
+
 class NumpyWrapper(Function):
 
     def __init__(self, function, shape):

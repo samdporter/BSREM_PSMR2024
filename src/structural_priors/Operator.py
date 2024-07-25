@@ -186,7 +186,6 @@ class NumpyBlockDataContainer(Operator):
     def __init__(self, domain_geometry, operator):
 
         self.domain_geometry = domain_geometry
-        self.array = np.stack([np.zeros((d.shape)) for d in domain_geometry.containers], axis=-1)
         self.operator = operator
 
     def direct(self, x, out=None):
