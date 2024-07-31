@@ -143,11 +143,11 @@ class Jacobian(Operator):
         jac_list = [self.weights[idx] * self.grad.direct(images[..., idx]) for idx in range(num_images)]
         if self.gpu:
             res = torch.stack(jac_list, dim=-2)
+            return res.numpy() if self.numpy_out else res
         else:
             res =  np.stack(jac_list, axis=-2)
-        # clear memory
-        del jac_list
-        return res.numpy() if self.numpy_out else res
+            return res
+        
 
     def adjoint(self, jacobians):
         num_images = jacobians.shape[-2]

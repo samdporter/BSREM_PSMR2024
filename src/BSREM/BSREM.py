@@ -114,6 +114,9 @@ class BSREMSkeleton(Algorithm):
             update_arr = x.as_array()
             update_arr[update_arr > self.update_max] = self.eps
             x.fill(update_arr)
+            
+    def calculate_preconditioner(self):
+        return self.x / self.average_sensitivity
         
     def update(self):
 
@@ -128,7 +131,7 @@ class BSREMSkeleton(Algorithm):
         g = self.subset_gradient(self.subset)
 
         # calculate our image update
-        self.x_update = (self.x) * g / self.average_sensitivity * self.step_size()
+        self.x_update = self.step_size() * self.calculate_preconditioner() * g
         self.limit_size(self.x_update) # necessary because of some bugs somewhere
 
         self.FOV_filter(self.x_update)
@@ -248,7 +251,8 @@ class BSREMmm_of(BSREMSkeleton):
     """
     def __init__(self, obj_fun, prior, initial, initial_step_size=1, relaxation_eta=0, save_path='', 
                  svrg=False, saga=False, stochastic=False, with_replacement=False, single_modality_update=False, 
-                 save_images =True, prior_is_subset=False, update_max=1e3, probabilities=None, svrg_fullgradient_interval=1, **kwargs):
+                 save_images =True, prior_is_subset=False, update_max=1e3, probabilities=None, svrg_fullgradient_interval=2, 
+                 kappa_image = None, prior_in_precond = False, freeze_precond_epoch = numpy.inf, **kwargs):
         '''
         construct Algorithm with lists of data and, objective functions, initial estimate, initial step size,
         step-size relaxation (per epoch) and optionally Algorithm parameters
@@ -264,12 +268,24 @@ class BSREMmm_of(BSREMSkeleton):
         super(BSREMmm_of, self).__init__(initial = initial, initial_step_size = initial_step_size, num_subsets = num_subsets,
                                          relaxation_eta = relaxation_eta, stochastic = stochastic, with_replacement = with_replacement,
                                          save_images = save_images, prior_is_subset = prior_is_subset, update_max = update_max, 
-                                         probabilities=None, **kwargs)
+                                         probabilities=probabilities,  **kwargs)
             
         if self.single_modality_update:
             self.num_subsets *= len(initial.containers)
         if self.prior_is_subset:
             self.num_subsets += 1
+            
+        if kappa_image is None:
+            self.kappa_image = initial.clone()
+            self.kappa_image = self.kappa_image.power(0)
+        else:
+            self.kappa_image = kappa_image
+            
+        self.prior_in_precond = prior_in_precond
+        if self.prior_in_precond:
+            self.prior_part_of_precond = self.kappa_image.power(2) * self.prior.hessian(initial)
+        self.freeze_precond_epoch = freeze_precond_epoch
+        self.x_bar = None
 
         if svrg:
             #try:
@@ -315,6 +331,23 @@ class BSREMmm_of(BSREMSkeleton):
 
         print(f"Number of subsets: {self.num_subsets}")
         
+    def calculate_preconditioner(self):
+        """Compute the preconditioner for the current iteration."""
+        # if we are using the prior in the preconditioner, we need to update the x_bar
+        # Only do this once so we don't overwrite the x_bar
+        if self.epoch() == self.freeze_precond_epoch and self.x_bar is None:
+            self.x_bar = self.x.copy()
+            self.x_bar*=0
+        if self.prior_in_precond:
+            if self.epoch() < self.freeze_precond_epoch:
+                return ((self.x / self.average_sensitivity).power(2) + self.prior_part_of_precond).sqrt()
+            else:
+                return ((self.x_bar / self.average_sensitivity).power(2) + self.prior_part_of_precond).sqrt()   
+        if self.epoch() < self.freeze_precond_epoch:
+            return self.x / self.average_sensitivity
+        else:
+            return self.x_bar / self.average_sensitivity
+        
     def subset_sensitivity(self, subset_num):
         ''' Compute sensitivity for a particular subset'''
         # note: sirf.STIR Poisson likelihood uses `get_subset_sensitivity(0) for the whole
@@ -329,8 +362,9 @@ class BSREMmm_of(BSREMSkeleton):
         return self.apply_variance_reduction_if_enabled(subset_grad, subset_num)
 
     def compute_prior_gradient(self):
+        """Compute gradient of the prior."""
         with timing('prior gradient time'):
-            return self.prior.gradient(self.x)
+            return - self.kappa_image.power(2) * self.prior.gradient(self.x) # negative because we want to maximise
 
     def compute_subset_gradient(self, subset_num, prior_gradient):
         """Compute gradient for a specific subset, optionally using prior gradient."""
@@ -338,11 +372,10 @@ class BSREMmm_of(BSREMSkeleton):
             if prior_gradient is None:
                 prior_gradient = self.compute_prior_gradient()
             self.FOV_filter(prior_gradient)
-            return -prior_gradient
+            return prior_gradient
 
         if self.single_modality_update:
             return self._compute_single_modality_subset_gradient(subset_num, prior_gradient)
-
 
         return self._compute_general_subset_gradient(subset_num, prior_gradient)
 
@@ -354,7 +387,7 @@ class BSREMmm_of(BSREMSkeleton):
         if not self.prior_is_subset:
             if prior_gradient is None:
                 prior_gradient = self.compute_prior_gradient()
-            modality_gradient -= prior_gradient / self.num_subsets
+            modality_gradient += prior_gradient / self.num_subsets
 
         self.FOV_filter(modality_gradient)
 
@@ -367,7 +400,7 @@ class BSREMmm_of(BSREMSkeleton):
         if not self.prior_is_subset:
             if prior_gradient is None:
                 prior_gradient = self.compute_prior_gradient()
-            general_gradient -= prior_gradient / self.num_subsets
+            general_gradient += prior_gradient / self.num_subsets
 
         self.FOV_filter(general_gradient)
 

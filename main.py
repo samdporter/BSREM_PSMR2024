@@ -7,11 +7,6 @@ import pandas as pd
 from numbers import Number
 import shutil
 
-# print pythonpath with lots of space around it ==
-print("\n\n")
-print(sys.path)
-print("\n\n")
-
 # import gaussian filter
 from scipy.ndimage import gaussian_filter
 
@@ -254,7 +249,7 @@ def main(args):
 
         initial_estimates = BlockDataContainer(pet_data["initial_image"], spect_data["initial_image"])
 
-        prior = get_vectorial_tv(bo, ct, args.alpha, args.beta, initial_estimates, delta=args.delta, gpu=args.gpu)
+        prior = get_vectorial_tv(bo, ct, args.alpha, args.beta, initial_estimates, delta=args.delta, gpu=False)
 
 
         pet2spect_zero = ZeroOperator(pet_data["initial_image"], spect_data["acquisition_data"])

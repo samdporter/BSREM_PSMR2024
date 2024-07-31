@@ -39,6 +39,18 @@ def cpu_nuc_norm_gradient_fair(x, eps):
     return res
 
 @jit(nopython=True, parallel=True)
+def cpu_nuc_norm_hessian_fair(x, eps):
+    res = np.zeros_like(x)
+    for i in prange(x.shape[0]):
+        for j in prange(x.shape[1]):
+            for k in prange(x.shape[2]):
+                u, s, vt = np.linalg.svd(x[i,j,k], full_matrices=False)
+                s = eps / (eps + np.abs(s))**2
+                s = np.diag(s)
+                res[i,j,k] = np.dot(u, np.dot(s, vt))
+    return res
+
+@jit(nopython=True, parallel=True)
 def cpu_nuc_norm_gradient_charbonnier(x, eps):
     res = np.zeros_like(x)
     for i in prange(x.shape[0]):
@@ -46,6 +58,18 @@ def cpu_nuc_norm_gradient_charbonnier(x, eps):
             for k in prange(x.shape[2]):
                 u, s, vt = np.linalg.svd(x[i,j,k], full_matrices=False)
                 s /= np.sqrt(s**2 + eps**2)
+                s = np.diag(s)
+                res[i,j,k] = np.dot(u, np.dot(s, vt))
+    return res
+
+@jit(nopython=True, parallel=True)
+def cpu_nuc_norm_hessian_fair(x, eps):
+    res = np.zeros_like(x)
+    for i in prange(x.shape[0]):
+        for j in prange(x.shape[1]):
+            for k in prange(x.shape[2]):
+                u, s, vt = np.linalg.svd(x[i,j,k], full_matrices=False)
+                s = eps**2 / (eps**2 + s**2)**(3/2)
                 s = np.diag(s)
                 res[i,j,k] = np.dot(u, np.dot(s, vt))
     return res
@@ -86,9 +110,13 @@ def cpu_nuc_norm_convex_conjugate(x):
 
 class CPUVectorialTotalVariation(Function):
 
-    def __init__(self, eps, smoothing_function='fair'):
-        self.eps = eps
+    def __init__(self, eps, smoothing_function='fair', kappa = None,):
+        self.eps = eps, 
         self.smoothing_function = smoothing_function
+        if kappa is not None:
+            self.kappa2 = kappa**2
+        else:
+            self.kappa2 = None
 
     def __call__(self, x):
         if self.smoothing_function == 'fair':
