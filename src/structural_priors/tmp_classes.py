@@ -106,6 +106,28 @@ class SIRFNumpyWrapper(Function):
 
         return res.flatten()
     
+    def hessian(self, x):
+        
+        if self.im_number is None:
+            arr = x.reshape(self.shape)
+        else:
+            arr = x.reshape(self.shape)[..., self.im_number]
+        tmp_image = self.template_image.clone()
+        tmp_image.fill(arr)
+
+        hess = self.function.hessian(self.operator.direct(tmp_image))
+        hess = -self.operator.adjoint(hess)
+        if type(hess) != np.ndarray:
+            hess = hess.as_array()
+
+        if self.im_number is None:
+            res = hess
+        else:
+            res = np.zeros(self.shape)
+            res[..., self.im_number] = hess
+
+        return res.flatten()
+    
 class STIRNumpyWrapper(Function):
 
     def __init__(self, function, operator, shape, template_image, im_number=None):

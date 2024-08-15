@@ -252,7 +252,7 @@ class BSREMmm_of(BSREMSkeleton):
     def __init__(self, obj_fun, prior, initial, initial_step_size=1, relaxation_eta=0, save_path='', 
                  svrg=False, saga=False, stochastic=False, with_replacement=False, single_modality_update=False, 
                  save_images =True, prior_is_subset=False, update_max=1e3, probabilities=None, svrg_fullgradient_interval=2, 
-                 kappa_image = None, prior_in_precond = False, freeze_precond_epoch = numpy.inf, **kwargs):
+                 prior_in_precond = False, freeze_precond_epoch = numpy.inf, **kwargs):
         '''
         construct Algorithm with lists of data and, objective functions, initial estimate, initial step size,
         step-size relaxation (per epoch) and optionally Algorithm parameters
@@ -275,15 +275,14 @@ class BSREMmm_of(BSREMSkeleton):
         if self.prior_is_subset:
             self.num_subsets += 1
             
-        if kappa_image is None:
-            self.kappa_image = initial.clone()
-            self.kappa_image = self.kappa_image.power(0)
-        else:
-            self.kappa_image = kappa_image
-            
         self.prior_in_precond = prior_in_precond
         if self.prior_in_precond:
-            self.prior_part_of_precond = self.kappa_image.power(2) * self.prior.hessian(initial)
+            self.prior_part_of_precond = self.prior.hessian(initial)
+            if isinstance(self.prior_part_of_precond, BlockDataContainer):
+                for i, el in enumerate(self.prior_part_of_precond):
+                    el.write(os.path.join(self.save_path, f'prior_part_of_precond_{i}.hv'))
+            else:
+                self.prior_part_of_precond.write(os.path.join(self.save_path, 'prior_part_of_precond.hv'))
         self.freeze_precond_epoch = freeze_precond_epoch
         self.x_bar = None
 
@@ -339,10 +338,11 @@ class BSREMmm_of(BSREMSkeleton):
             self.x_bar = self.x.copy()
             self.x_bar*=0
         if self.prior_in_precond:
+            one = self.x.clone().power(0)
             if self.epoch() < self.freeze_precond_epoch:
-                return ((self.x / self.average_sensitivity).power(2) + self.prior_part_of_precond).sqrt()
+                return one/((self.average_sensitivity / self.x) + self.prior_part_of_precond) 
             else:
-                return ((self.x_bar / self.average_sensitivity).power(2) + self.prior_part_of_precond).sqrt()   
+                return one/((self.average_sensitivity / self.x_bar) + self.prior_part_of_precond) 
         if self.epoch() < self.freeze_precond_epoch:
             return self.x / self.average_sensitivity
         else:
@@ -364,7 +364,7 @@ class BSREMmm_of(BSREMSkeleton):
     def compute_prior_gradient(self):
         """Compute gradient of the prior."""
         with timing('prior gradient time'):
-            return - self.kappa_image.power(2) * self.prior.gradient(self.x) # negative because we want to maximise
+            return - self.prior.gradient(self.x) # negative because we want to maximise
 
     def compute_subset_gradient(self, subset_num, prior_gradient):
         """Compute gradient for a specific subset, optionally using prior gradient."""
@@ -475,9 +475,14 @@ class BSREMmm_of(BSREMSkeleton):
         """ Method to save images from the current iteration, including gradient images if using SVRG. """
         self.write_image(self.x, 'image')
         
+        if self.prior_in_precond:
+            self.write_image(self.calculate_preconditioner(), 'preconditioner')
+            # save precond without prior
+            precond_no_prior = self.x / self.average_sensitivity
+            self.write_image(precond_no_prior, 'preconditioner_no_prior')
         # If SVRG is enabled, write the gradient images as well
         if self.svrg or self.saga:
             self.write_image(self.g, 'g')
-            for i, el in enumerate(self.sg):
-                self.write_image(el, f'sg_{i}')
+            #for i, el in enumerate(self.sg):
+            #    self.write_image(el, f'sg_{i}')
         

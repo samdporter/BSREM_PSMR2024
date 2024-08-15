@@ -21,6 +21,7 @@ from sirf.STIR import (ImageData, AcquisitionData,
                        make_Poisson_loglikelihood,
                        )
 from sirf.Reg import AffineTransformation
+#AcquisitionData.set_storage_scheme('file')
 
 # CIL imports
 from cil.framework import BlockDataContainer, DataContainer
@@ -30,17 +31,16 @@ parser = argparse.ArgumentParser(description='BSREM')
 
 parser.add_argument('--modality', type=str, default='both', help='modality - can be pet, spect or both')
 parser.add_argument('--alpha', type=float, default=256, help='alpha')
-parser.add_argument('--beta', type=float, default=1, help='beta')
+parser.add_argument('--beta', type=float, default=10, help='beta')
 parser.add_argument('--delta', type=float, default=1e-6, help='delta')
 # num_subsets can be an integer or a string of two integers separated by a comma
 parser.add_argument('--num_subsets', type=str, default="12", help='number of subsets')
-
 
 parser.add_argument('--iterations', type=int, default=240, help='max iterations')
 parser.add_argument('--update_interval', type=int, default=12, help='update interval')
 parser.add_argument('--relaxation_eta', type=float, default=0.1, help='relaxation eta')
 
-parser.add_argument('--data_path', type=str, default="/home/sam/data/phantom_data/for_cluster/", help='data path')
+parser.add_argument('--data_path', type=str, default="/home/sam/data/anthropomorphic_Y90/phantom/for_cluster", help='data path')
 parser.add_argument('--output_path', type=str, default="/home/sam/working/BSREM_PSMR_MIC_2024/results/test", help='output path')
 parser.add_argument('--source_path', type=str, default='/home/sam/working/BSREM_PSMR_MIC_2024/src', help='source path')
 parser.add_argument('--working_path', type=str, default='/home/sam/working/BSREM_PSMR_MIC_2024/tmp', help='working path')
@@ -67,7 +67,7 @@ from structural_priors.tmp_classes import (OperatorCompositionFunction,
                                                    ZoomOperator, CompositionOperator,
                                                     NiftyResampleOperator,
                                                     FairL21Norm,
-                                                )
+                                                        )
 
 from structural_priors.Operator import Operator, NumpyDataContainer, NumpyBlockDataContainer
 from structural_priors.Function import Function, SIRFBlockFunction
@@ -106,7 +106,7 @@ def get_spect_data(path):
 
     spect_data = {}
     spect_data["acquisition_data"] = AcquisitionData(os.path.join(path,  "SPECT/peak_1_projdata__f1g1d0b0.hs"))
-    spect_data["additive"] = AcquisitionData(os.path.join(path,  "SPECT/simind_scatter_osem_555_full_smoothed.hs"))
+    spect_data["additive"] = AcquisitionData(os.path.join(path,  "SPECT/simind_scatter_ellipses_megp_cpd.hs"))
     spect_data["attenuation"] = ImageData(os.path.join(path,  "SPECT/umap_zoomed.hv"))
     spect_data["initial_image"] = ImageData(os.path.join(path,  "SPECT/spect_osem_20.hv")).maximum(0)
 
@@ -125,7 +125,7 @@ def get_pet_am(pet_data, gpu):
         pet_am.set_num_tangential_LORs(10)
     asm = AcquisitionSensitivityModel(pet_data["normalisation"])
     pet_am.set_acquisition_sensitivity(asm)
-    pet_am.set_additive_term(pet_data["additive"])
+    pet_am.set_additive_term(pet_data["additive"]/50)
     # using adjoint(forard(image)) & STIR find_fwhm_in_image
     # 1cm FWHM from NEMA 2001 (Mediso AnyScan specificaitons)
     # operations applied one after the other to find total FWHM
@@ -164,9 +164,16 @@ def get_objective_function(data, acq_model, initial_image, num_subsets):
     
     return obj_fun
 
-def get_vectorial_tv(bo, ct, alpha, beta, initial_estimates, delta, gpu=False):
+def get_vectorial_tv(bo, ct, alpha, beta, initial_estimates, delta, gpu=False, kappa=None):
+    
+    if kappa is not None:
+        kappas = [k.as_array() for k in kappa.containers]
+    else:
+        kappas = None
+
     vtv = create_vectorial_total_variation(smoothing_function='fair', eps=delta, gpu=gpu)
-    jac = NumpyBlockDataContainer(bo.direct(initial_estimates),Jacobian(anatomical=ct.as_array(), voxel_sizes=ct.voxel_sizes(), weights=[alpha, beta], gpu=gpu))
+    jac = NumpyBlockDataContainer(bo.direct(initial_estimates),Jacobian(anatomical=ct.as_array(), voxel_sizes=ct.voxel_sizes(), 
+                                                                        weights=[alpha, beta], gpu=gpu, kappas = kappas))
     jac_co = CompositionOperator([bo, jac])
     jac_co.range_geometry = lambda: initial_estimates
     return OperatorCompositionFunction(vtv, jac_co)
@@ -176,8 +183,20 @@ def get_tv(operator, ct, regularisation_parameter, initial_estimate, delta):
     grad = NumpyDataContainer(operator.direct(initial_estimate), DirectionalGradient(anatomical=ct.as_array(), voxel_sizes=ct.voxel_sizes()))
     grad_co = CompositionOperator([operator, grad])
     grad_co.range_geometry = lambda: initial_estimate
-    return OperatorCompositionFunction(dtv, grad_co)    
+    return OperatorCompositionFunction(dtv, grad_co) 
 
+def compute_kappa_squared_image(obj_fun, initial_image):
+    '''
+    Computes a "kappa" image for a prior as sqrt(H.1). This will attempt to give uniform "perturbation response".
+    See Yu-jung Tsai et al. TMI 2020 https://doi.org/10.1109/TMI.2019.2913889
+
+    WARNING: Assumes the objective function has been set-up already
+    '''
+    one_image = initial_image.power(0)
+    # This needs SIRF 3.7. If you don't have that yet, you should probably upgrade anyway!
+    Hessian_row_sum = obj_fun.multiply_with_Hessian(initial_image,  one_image)
+    return (-1*Hessian_row_sum)
+    
 # Change to working directory - this is where the tmp_ files will be saved
 os.chdir(args.working_path)
 
@@ -204,7 +223,7 @@ def main(args):
             spect_num_subsets = int(subset_list[1])
 
     cyl, gauss, = get_filters()
-    ct = ImageData(os.path.join(args.data_path, "CT/ct_zoomed_pet.hv"))
+    ct = ImageData(os.path.join(args.data_path, "CT/ct_zoomed_smallFOV.hv"))
     # normalise the CT image
     ct+=(-ct).max()
     ct/=ct.max()    
@@ -216,9 +235,8 @@ def main(args):
         #gauss.apply(pet_data["initial_image"])
         pet_data["initial_image"].write("initial_image_0.hv")
 
-        pet2ct_zoom = ZoomOperator(ct, pet_data["initial_image"])
-        pet2ct = get_zoom_transform(args.data_path, "pet2spect_zoomed_pet.txt", pet2ct_zoom, ct)
-        pet_am = get_pet_am(pet_data,  args.gpu)
+        pet2ct = NiftyResampleOperator(ct, pet_data["initial_image"], AffineTransformation(os.path.join(args.data_path, "Registration", "pet_to_ct_smallFOV.txt")))
+        pet_am = get_pet_am(pet_data,  gpu=True)
         pet_am.direct = lambda x: pet_am.forward(x)
         pet_am.adjoint = lambda x: pet_am.backward(x)
         
@@ -231,8 +249,7 @@ def main(args):
         #gauss.apply(spect_data["initial_image"])
         spect_data["initial_image"].write("initial_image_1.hv")
 
-        spect2ct_zoom = ZoomOperator(ct, spect_data["initial_image"])
-        spect2ct = get_zoom_transform(args.data_path, "spect2ct_zoomed_pet.txt", spect2ct_zoom, ct)
+        spect2ct = NiftyResampleOperator(ct, spect_data["initial_image"], AffineTransformation(os.path.join(args.data_path, "Registration", "spect_to_ct_smallFOV.txt")))
         spect_am = get_spect_am(spect_data, args.keep_all_views_in_cache)
         spect_am.direct = lambda x: spect_am.forward(x)
         spect_am.adjoint = lambda x: spect_am.backward(x)
@@ -249,8 +266,13 @@ def main(args):
 
         initial_estimates = BlockDataContainer(pet_data["initial_image"], spect_data["initial_image"])
 
-        prior = get_vectorial_tv(bo, ct, args.alpha, args.beta, initial_estimates, delta=args.delta, gpu=False)
+        kappa = bo.direct(BlockDataContainer(compute_kappa_squared_image(pet_obj_fun, pet_data["initial_image"]),compute_kappa_squared_image(spect_obj_fun, spect_data["initial_image"])))
+        for i, el in enumerate(kappa.containers):
+            gauss.apply(el)
+            el.write(f"kappa_{i}.hv")
+        #kappa = None
 
+        prior = get_vectorial_tv(bo, ct, args.alpha, args.beta, initial_estimates, delta=args.delta, gpu=args.gpu, kappa=kappa)
 
         pet2spect_zero = ZeroOperator(pet_data["initial_image"], spect_data["acquisition_data"])
         spect2pet_zero = ZeroOperator(spect_data["initial_image"], pet_data["acquisition_data"])
@@ -261,7 +283,6 @@ def main(args):
         data = BlockDataContainer(pet_data["acquisition_data"], spect_data["acquisition_data"])
 
         initial = initial_estimates
-        
         
     elif args.modality.lower() == "pet":
         acquisition_model = pet_am
@@ -280,6 +301,7 @@ def main(args):
         initial = spect_data["initial_image"]
         
     acquisition_model.is_linear = MethodType(lambda self: True, acquisition_model)
+        
 
     if args.modality.lower() == "both":
         bsrem=BSREMmm_of(SIRFBlockFunction([pet_obj_fun, spect_obj_fun]), prior, 
@@ -287,7 +309,7 @@ def main(args):
                          update_objective_interval=args.update_interval, save_path=args.working_path,
                          stochastic=args.stochastic, svrg=args.svrg, saga=args.saga, with_replacement=args.with_replacement,
                          single_modality_update=args.single_modality_update, save_images = args.save_images,
-                         prior_is_subset=args.prior_is_subset, update_max=100*initial.max())
+                         prior_is_subset=args.prior_is_subset, update_max=100*initial.max(), prior_in_precond=True)
     else:
         bsrem = BSREMmm_of(obj_fun, prior, initial=initial, initial_step_size=1, 
                            relaxation_eta=args.relaxation_eta, 
@@ -323,6 +345,7 @@ if __name__ == "__main__":
     elif isinstance(bsrem.x, BlockDataContainer):
         for i, el in enumerate(bsrem.x.containers):
             el.write(os.path.join(args.output_path, f"bsrem_modality_{i}_a_{args.alpha}_b_{args.beta}.hv"))
+    
     df = pd.DataFrame(l[0] for l in bsrem.loss) 
     df.to_csv(os.path.join(args.output_path, f"bsrem_objective_a_{args.alpha}_b_{args.beta}.csv"))
 

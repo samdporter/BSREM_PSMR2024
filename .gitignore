@@ -5,6 +5,7 @@
 *.v
 *.ahv
 !data/*
+*.png
 
 # pycache
 *__pycache__/
@@ -25,3 +26,5 @@ src/BSREM/partitioner
 scripts/
 
 src/structural_priors/obsolete/
+
+PSMR_presentation/

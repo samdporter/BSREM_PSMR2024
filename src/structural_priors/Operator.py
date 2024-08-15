@@ -2,6 +2,17 @@ from .BlockDataContainer import BlockDataContainer
 import numpy as np
 from numba import njit, prange, jit
 
+import time
+from contextlib import contextmanager
+
+# Define the context manager
+@contextmanager
+def timing(label: str):
+    t0 = time.time()
+    yield lambda: None  # This yields a do-nothing function to satisfy the 'with' syntax
+    t1 = time.time()
+    print(f'{label}: {t1 - t0:.6f} seconds')
+
 @jit(forceobj=True)
 def power_iteration(operator, input_shape, num_iterations=100):
     """
