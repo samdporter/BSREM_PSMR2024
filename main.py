@@ -27,10 +27,12 @@ from cil.optimisation.operators import BlockOperator, ZeroOperator
 parser = argparse.ArgumentParser(description='BSREM')
 
 parser.add_argument('--alpha', type=float, default=256, help='alpha')
-parser.add_argument('--beta', type=float, default=10, help='beta')
+parser.add_argument('--beta', type=float, default=0.1, help='beta')
 parser.add_argument('--delta', type=float, default=1e-6, help='delta')
 # num_subsets can be an integer or a string of two integers separated by a comma
 parser.add_argument('--num_subsets', type=str, default="12", help='number of subsets')
+parser.add_argument('--use_kappa', action='store_true', help='use kappa')
+parser.add_argument('--initial_step_size', type=float, default=1, help='initial step size')
 
 parser.add_argument('--iterations', type=int, default=240, help='max iterations')
 parser.add_argument('--update_interval', type=int, default=12, help='update interval')
@@ -51,8 +53,9 @@ parser.add_argument('--saga', action='store_true', help='Enables SAGA')
 parser.add_argument('--with_replacement', action='store_true', help='Enables replacement')
 parser.add_argument('--single_modality_update', action='store_true', help='Enables single modality update')
 parser.add_argument('--prior_is_subset', action='store_true', help='Sets prior as subset')
-parser.add_argument('--gpu', action='store_true', help='Enables GPU')
-parser.add_argument('--keep_all_views_in_cache', action='store_true', help='Keep all views in cache')
+parser.add_argument('--gpu', action='store_false', default=True, help='Disables GPU')
+parser.add_argument('--keep_all_views_in_cache', action='store_false', default=True, help='Do not keep all views in cache')
+
 
 args = parser.parse_args()
 
@@ -149,7 +152,7 @@ def get_spect_am(spect_data, keep_all_views_in_cache=False):
     spect_psf = SeparableGaussianImageFilter()
     #spect_psf.set_fwhms((22, 19, 19))
     #spect_am.set_image_data_processor(spect_psf)
-    #spect_am.set_additive_term(spect_data["additive"]) #TODO: change back
+    spect_am.set_additive_term(spect_data["additive"]) #TODO: change back
     #spect_am.set_up(spect_data["acquisition_data"], spect_data["initial_image"])
     return spect_am
 
@@ -162,16 +165,16 @@ def get_objective_function(data, acq_model, initial_image, num_subsets):
     
     return obj_fun
 
-def get_vectorial_tv(bo, ct, alpha, beta, initial_estimates, delta, gpu=False, kappa=None):
-    
-    if kappa is not None:
-        kappas = [k.as_array() for k in kappa.containers]
+def get_vectorial_tv(bo, ct, alpha, beta, initial_estimates, delta, gpu=False, kappa=False):
+    if kappa:
+        kappas = [k.as_array() for weight, k in zip([alpha, beta], kappa.containers)]
     else:
         kappas = None
+    weights = [alpha, beta]
 
     vtv = create_vectorial_total_variation(smoothing_function='fair', eps=delta, gpu=gpu)
     jac = NumpyBlockDataContainer(bo.direct(initial_estimates),Jacobian(anatomical=ct.as_array(), voxel_sizes=ct.voxel_sizes(), 
-                                                                        weights=[alpha, beta], gpu=gpu, kappas = kappas))
+                                                                        gpu=gpu, weights=weights, kappas=None))
     jac_co = CompositionOperator([bo, jac])
     jac_co.range_geometry = lambda: initial_estimates
     return OperatorCompositionFunction(vtv, jac_co)
@@ -183,9 +186,8 @@ def compute_kappa_squared_image(obj_fun, initial_image):
 
     WARNING: Assumes the objective function has been set-up already
     '''
-    one_image = initial_image.power(0)
     # This needs SIRF 3.7. If you don't have that yet, you should probably upgrade anyway!
-    Hessian_row_sum = obj_fun.multiply_with_Hessian(initial_image,  one_image)
+    Hessian_row_sum = obj_fun.multiply_with_Hessian(initial_image,  initial_image.allocate(1))
     return (-1*Hessian_row_sum)
     
 # Change to working directory - this is where the tmp_ files will be saved
@@ -252,11 +254,13 @@ def main(args):
 
     initial_estimates = BlockDataContainer(pet_data["initial_image"], spect_data["initial_image"])
 
-    kappa = bo.direct(BlockDataContainer(compute_kappa_squared_image(pet_obj_fun, pet_data["initial_image"]),compute_kappa_squared_image(spect_obj_fun, spect_data["initial_image"])))
-    for i, el in enumerate(kappa.containers):
-        gauss.apply(el)
-        el.write(f"kappa_{i}.hv")
-    #kappa = None
+    if args.use_kappa:
+        kappa = bo.direct(BlockDataContainer(compute_kappa_squared_image(pet_obj_fun, pet_data["initial_image"]),compute_kappa_squared_image(spect_obj_fun, spect_data["initial_image"])))
+        for i, el in enumerate(kappa.containers):
+            gauss.apply(el)
+            el.write(f"kappa_{i}.hv")
+    else:
+        kappa = False
 
     prior = get_vectorial_tv(bo, ct, args.alpha, args.beta, initial_estimates, delta=args.delta, gpu=args.gpu, kappa=kappa)
 
@@ -273,11 +277,11 @@ def main(args):
     acquisition_model.is_linear = MethodType(lambda self: True, acquisition_model)
         
     bsrem=BSREMmm_of(SIRFBlockFunction([pet_obj_fun, spect_obj_fun]), prior, 
-                        initial=initial, initial_step_size=100, relaxation_eta=args.relaxation_eta, 
+                        initial=initial, initial_step_size=args.initial_step_size, relaxation_eta=args.relaxation_eta, 
                         update_objective_interval=args.update_interval, save_path=args.working_path,
                         stochastic=args.stochastic, svrg=args.svrg, saga=args.saga, with_replacement=args.with_replacement,
                         single_modality_update=args.single_modality_update, save_images = args.save_images,
-                        prior_is_subset=args.prior_is_subset, update_max=100*initial.max(), prior_in_precond=True)
+                        prior_is_subset=args.prior_is_subset, update_max=100*initial.max())
 
     bsrem.max_iteration=args.iterations
     bsrem.run(args.iterations, verbose=2)
@@ -306,6 +310,7 @@ if __name__ == "__main__":
     # Save reconstructed images based on type
     if isinstance(bsrem.x, ImageData):
         bsrem.x.write(os.path.join(args.output_path, f"bsrem_a_{args.alpha}_b_{args.beta}.hv"))
+
     elif isinstance(bsrem.x, BlockDataContainer):
         for i, el in enumerate(bsrem.x.containers):
             el.write(os.path.join(args.output_path, f"bsrem_modality_{i}_a_{args.alpha}_b_{args.beta}.hv"))
@@ -333,7 +338,7 @@ if __name__ == "__main__":
     # Move leftover files (if any) to the output path
     for file in os.listdir(args.working_path):
         if file.endswith((".hv", ".v", ".ahv")):
-            print(f"Moving {file}")
+            print(f"Moving to {os.path.join(args.output_path, file)}")
             shutil.move(os.path.join(args.working_path, file), os.path.join(args.output_path, file))
 
     print("Done")

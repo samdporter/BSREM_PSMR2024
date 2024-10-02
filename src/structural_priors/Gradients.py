@@ -119,6 +119,7 @@ class BlockOperator(Operator):
             return BlockDataContainer(res) 
 
 class Jacobian(Operator):
+    """ Jacobian operation with optional weighting """
     def __init__(self, voxel_sizes=(1, 1, 1), weights=None, kappas=None,
                  bnd_cond='Neumann', method='forward',
                  anatomical=None, numpy_out=True, gpu=False) -> None:
@@ -168,11 +169,10 @@ class Jacobian(Operator):
         # if weights is a list of arrays, we need to expand dims
         if self.kappas is not None:
             jac_list = [kappas[idx] * self.grad.direct(images[..., idx]) for idx in range(num_images)]
+        elif self.weights is not None:
+            jac_list = [self.weights[idx] * self.grad.direct(images[..., idx]) for idx in range(num_images)]
         else:
-            if self.weights is not None:
-                jac_list = [self.weights[idx] * self.grad.direct(images[..., idx]) for idx in range(num_images)]
-            else:
-                jac_list = [self.grad.direct(images[..., idx]) for idx in range(num_images)]
+            jac_list = [self.grad.direct(images[..., idx]) for idx in range(num_images)]
 
         if self.gpu:
             return torch.stack(jac_list, dim=-2)
@@ -180,17 +180,15 @@ class Jacobian(Operator):
             return np.stack(jac_list, axis=-2)
         
     def adjoint(self, jacobians):
-
         num_images = jacobians.shape[-2]
         adjoint_list = []
         for idx in range(num_images):
             if self.kappas is not None:
                 adjoint_list.append(self.kappas[idx] * self.grad.adjoint(jacobians[..., idx,:]))
+            elif self.weights is not None:
+                adjoint_list.append(self.weights[idx] * self.grad.adjoint(jacobians[..., idx,:]))
             else:
-                if self.weights is not None:
-                    adjoint_list.append(self.weights[idx] * self.grad.adjoint(jacobians[..., idx,:]))
-                else:
-                    adjoint_list.append(self.grad.adjoint(jacobians[..., idx,:]))
+                adjoint_list.append(self.grad.adjoint(jacobians[..., idx,:]))
                     
         if self.gpu:
             res = torch.stack(adjoint_list, dim=-1)
@@ -224,6 +222,8 @@ class Gradient(Operator):
                     res.append(self.forward_diff(x, i))
                 elif self.method == 'backward':
                     res.append(self.backward_diff(x, i))
+                elif self.method == 'central':
+                    res.append((self.forward_diff(x, i) + self.backward_diff(x, i)) / 2)
                 else:
                     raise ValueError('Not implemented')
                 if self.voxel_sizes[i] != 1.0:
@@ -249,6 +249,8 @@ class Gradient(Operator):
                     res.append(-self.backward_diff(x[..., i], i))
                 elif self.method == 'backward':
                     res.append(-self.forward_diff(x[..., i], i))
+                elif self.method == 'central':
+                    res.append((-self.forward_diff(x[..., i], i) - self.backward_diff(x[..., i], i)) / 2)
                 else:
                     raise ValueError('Not implemented')
                 if self.voxel_sizes[i] != 1.0:
@@ -324,9 +326,6 @@ class DirectionalGradient(Operator):
             return res.numpy() if self.numpy_out else res
         else:
             return res
-
-    
-
 
 class CPUFiniteDifferenceOperator(Operator):
 
