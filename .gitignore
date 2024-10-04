@@ -28,3 +28,5 @@ scripts/
 src/structural_priors/obsolete/
 
 PSMR_presentation/
+
+test_*.py
