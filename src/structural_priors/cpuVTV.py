@@ -3,6 +3,7 @@ from numba import njit, prange
 import numpy as np
 from numba import jit
 from .Function import Function
+from numbers import Number
 
 @jit(nopython=True, parallel=True)
 def cpu_nuc_norm_fair(x, eps):
@@ -23,28 +24,6 @@ def cpu_nuc_norm_charbonnier(x, eps):
             for k in prange(x.shape[2]):
                 u, s, vt = np.linalg.svd(x[i,j,k], full_matrices=False)
                 acc+= np.sum(np.sqrt(s**2 + eps**2) - eps)
-    return acc
-
-@jit(nopython=True, parallel=True)
-def cpu_nuc_norm_fair_kappa(x, eps, kappa):
-    acc = 0
-    for i in prange(x.shape[0]):
-        for j in prange(x.shape[1]):
-            for k in prange(x.shape[2]):
-                u, s, vt = np.linalg.svd(x[i,j,k], full_matrices=False)
-                s  = np.abs(s)
-                tmp = eps * (s/eps - np.log(1 + s/eps))
-                acc+= np.sum(tmp) * kappa[i,j,k]
-    return acc
-
-def cpu_nuc_norm_charbonnier_kappa(x, eps, kappa):
-    acc = 0
-    for i in prange(x.shape[0]):
-        for j in prange(x.shape[1]):
-            for k in prange(x.shape[2]):
-                u, s, vt = np.linalg.svd(x[i,j,k], full_matrices=False)
-                tmp = np.sqrt(s**2 + eps**2) - eps
-                acc+= np.sum(tmp) * kappa[i,j,k]
     return acc
 
 @jit(nopython=True, parallel=True)
@@ -106,13 +85,13 @@ def cpu_nuc_norm(x):
     return acc
 
 @jit(nopython=True, parallel=True)
-def cpu_nuc_norm_kappa(x, kappa):
+def cpu_nuc_norm_weights(x, weights):
     acc = 0
     for i in prange(x.shape[0]):
         for j in prange(x.shape[1]):
             for k in prange(x.shape[2]):
                 u, s, vt = np.linalg.svd(x[i,j,k], full_matrices=False)
-                acc += np.sum(s) * kappa[i,j,k]
+                acc += np.sum(s) * weights[i,j,k]
     return acc
 
 @jit(nopython=True, parallel=True)
@@ -141,12 +120,27 @@ def cpu_nuc_norm_convex_conjugate(x):
 
 class CPUVectorialTotalVariation(Function):
 
-    def __init__(self, eps, smoothing_function='fair', kappa = None):
+    def __init__(self, eps, smoothing_function='fair', weights = None):
         self.eps = eps
         self.smoothing_function = smoothing_function
+        self.weights = 1
+
+    def _apply_weights(self, x):
+            # if self.weights is list of scalars, multiply each channel by the corresponding scalar
+        if self.weights is not None:
+            if isinstance(self.weights, list):
+                for i, w in enumerate(self.weights):
+                    x[..., i, :] *= w
+            else:
+                # If self.weights is a single scalar, apply it to all channels
+                if self.weights != 1 and isinstance(self.weights, Number):
+                    x *= self.weights
+                else: 
+                    print('Weights not applied')
+        return x
 
     def __call__(self, x):
-        return self.get_value(x)
+            return self.get_value(self._apply_weights(x))
     
     def get_value(self, x):
         if self.smoothing_function == 'fair':
@@ -163,18 +157,18 @@ class CPUVectorialTotalVariation(Function):
         if self.smoothing_function == None:
             raise ValueError('Smoothing function not defined')
         if self.smoothing_function == 'fair':
-            return cpu_nuc_norm_gradient_fair(x.astype(np.float64), self.eps)
+            return cpu_nuc_norm_gradient_fair(self._apply_weights(x).astype(np.float64), self.eps)
         elif self.smoothing_function == 'charbonnier':
-            return cpu_nuc_norm_gradient_charbonnier(x.astype(np.float64), self.eps)
+            return cpu_nuc_norm_gradient_charbonnier(self._apply_weights(x).astype(np.float64), self.eps)
     
     def hessian(self, x):
         
         if self.smoothing_function == None:
             raise ValueError('Smoothing function not defined')
         if self.smoothing_function == 'fair':
-            return cpu_nuc_norm_hessian_fair(x.astype(np.float64), self.eps)
+            return cpu_nuc_norm_hessian_fair(self._apply_weights(x).astype(np.float64), self.eps)
         elif self.smoothing_function == 'charbonnier':
-            return cpu_nuc_norm_hessian_fair(x.astype(np.float64), self.eps)
+            return cpu_nuc_norm_hessian_fair(self._apply_weights(x).astype(np.float64), self.eps)
 
 
     def proximal(self, x, tau):      
@@ -182,7 +176,7 @@ class CPUVectorialTotalVariation(Function):
         if self.smoothing_function != None:
             raise ValueError('Cannot use proximal operator with smoothing function')
 
-        return cpu_nuc_norm_proximal(x.astype(np.float64), tau)
+        return cpu_nuc_norm_proximal(self._apply_weights(x).astype(np.float64), tau)
     
     def convex_conjugate(self, x):
         return 0

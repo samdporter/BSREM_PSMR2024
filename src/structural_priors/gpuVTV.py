@@ -1,6 +1,7 @@
 import torch
 from torch import vmap
 import numpy as np
+from numbers import Number
 
 from .Function import Function
 
@@ -284,26 +285,39 @@ class GPUVectorialTotalVariation(Function):
     """ 
     GPU implementation of the vectorial total variation function.
     """
-    def __init__(self, eps=0, norm = 'nuclear', order=None, smoothing_function=None, numpy_out=False):        
+    def __init__(self, eps=None, norm = 'nuclear', weights=None,
+                 smoothing_function=None, numpy_out=False):        
 
         """Initializes the GPUVectorialTotalVariation class.
-        """        
-        self.eps = torch.tensor(eps)
+        """    
+        if eps is not None:    
+            self.eps = torch.tensor(eps)
+        else:
+            self.eps = torch.tensor(0)
         self.norm = norm
-        self.order = order
         self.smoothing_function = smoothing_function
         self.numpy_out = numpy_out
+        self.weights = 1
+
+    def _apply_weights(self, x):
+            # if self.weights is list of scalars, multiply each channel by the corresponding scalar
+        if self.weights is not None:
+            if isinstance(self.weights, list):
+                for i, w in enumerate(self.weights):
+                    x[..., i, :] *= w
+            else:
+                # If self.weights is a single scalar, apply it to all channels
+                if self.weights != 1 and isinstance(self.weights, Number):
+                    x *= self.weights
+                else: 
+                    print('No weights applied')
+
+        return x
 
     def direct(self, x):
 
-        if isinstance(x, np.ndarray):
-            x = torch.tensor(x, device=device)
-
         # order defined by smallest of the last two dimensions
-        if self.order is None:
-            order = 1 if x.shape[-2] <= x.shape[-1] else 0
-        else:
-            order = self.order
+        order = 1 if x.shape[-2] <= x.shape[-1] else 0
 
         if self.norm == 'nuclear':
             norm_func = l1_norm_torch
@@ -321,7 +335,7 @@ class GPUVectorialTotalVariation(Function):
         else:
             smoothing_func = nothing_torch
 
-        return vectorised_norm(x, norm_func, smoothing_func, order, self.eps)
+        return vectorised_norm(self._apply_weights(x), norm_func, smoothing_func, order, self.eps)
 
     def __call__(self, x):
         
@@ -340,10 +354,7 @@ class GPUVectorialTotalVariation(Function):
             x.to(device)
 
         # order defined by smallest of the last two dimensions
-        if self.order is None:
-            order =1 if x.shape[-2] <= x.shape[-1] else 0
-        else:
-            order = self.order
+        order =1 if x.shape[-2] <= x.shape[-1] else 0
 
         if self.norm == 'nuclear':
             norm_func = l1_norm_prox_torch
@@ -352,8 +363,8 @@ class GPUVectorialTotalVariation(Function):
         else:
             raise ValueError('Norm not defined')
 
-        return vectorised_norm_func(x, norm_func, tau, order)
-
+        return vectorised_norm_func(self._apply_weights(x), norm_func, tau, order)
+    
     def gradient(self, x):
 
         if isinstance(x, np.ndarray):
@@ -362,11 +373,8 @@ class GPUVectorialTotalVariation(Function):
             x.to(device)
 
         # order defined by smallest of the last two dimensions
-        if self.order is None:
-            order =1 if x.shape[-2] <= x.shape[-1] else 0
-        else:
-            order = self.order
-
+        order =1 if x.shape[-2] <= x.shape[-1] else 0
+        
         if self.smoothing_function == 'fair':
             smoothing_func = fair_grad_torch
         elif self.smoothing_function == 'charbonnier':
@@ -376,7 +384,7 @@ class GPUVectorialTotalVariation(Function):
         else:
             raise ValueError('Smoothing function not defined')
 
-        return vectorised_norm_func(x, smoothing_func, self.eps, order)
+        return vectorised_norm_func(self._apply_weights(x), smoothing_func, self.eps, order)
 
     def hessian(self, x):
 
@@ -386,11 +394,8 @@ class GPUVectorialTotalVariation(Function):
         x.to(device)
 
         # order defined by smallest of the last two dimensions
-        if self.order is None:
-            order =1 if x.shape[-2] <= x.shape[-1] else 0
-        else:
-            order = self.order
-
+        order =1 if x.shape[-2] <= x.shape[-1] else 0
+        
         if self.smoothing_function == 'fair':
             smoothing_func = fair_hessian_torch
         elif self.smoothing_function == 'charbonnier':
@@ -400,4 +405,4 @@ class GPUVectorialTotalVariation(Function):
         else:
             raise ValueError('Smoothing function not defined')
 
-        return vectorised_norm_func(x, smoothing_func, self.eps, order)
+        return vectorised_norm_func(self._apply_weights(x), smoothing_func, self.eps, order)

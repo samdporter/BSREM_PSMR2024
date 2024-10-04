@@ -171,49 +171,7 @@ class STIRNumpyWrapper(Function):
 
         return res.flatten()
     
-### Smoothing Functions ###
-    
-class FairPotential(Function):
 
-    def __init__(self, delta = 0.1):
-        self.delta = delta
-
-    def forward(self, x):
-        return jnp.sum(self.delta * (jnp.abs(x/self.delta) - jnp.log(1 + jnp.abs(x/self.delta))))
-    
-    def gradient(self, x):
-        return x / (self.delta + jnp.abs(x))
-    
-    def hessian(self, x):
-        return self.delta / (self.delta + jnp.abs(x))**2
-    
-class HuberPotential(Function):
-
-    def __init__(self, delta = 0.1):
-        self.delta = delta
-    
-    def forward(self, x):
-        return jnp.sum(jnp.where(jnp.abs(x) < self.delta, 0.5 * x**2, self.delta * (jnp.abs(x) - 0.5 * self.delta)))
-    
-    def gradient(self, x):
-        return jnp.where(jnp.abs(x) < self.delta, x, self.delta * jnp.sign(x))
-    
-class Charbonnier(Function):
-
-    def __init__(self, delta = 0.1):
-        self.delta = delta
-    
-    def forward(self, x):
-        return jnp.sum(jnp.sqrt(x**2 + self.delta**2) - self.delta)
-    
-    def proximal(self, x, step_size):
-        return x / (1 + step_size / self.delta)
-    
-    def gradient(self, x):
-        return x / jnp.sqrt(x**2 + self.delta**2)
-    
-    def hessian(self, x):
-        return self.delta**2 / (x**2 + self.delta**2)**(3/2)
     
 class PeronaMalik(Function):
 
@@ -482,35 +440,6 @@ class Img2ArrayOperator(Operator):
         return res
 
     
-class DiagonalOperator(Operator):
-
-    def __init__(self, diagonal):
-        self.diagonal = diagonal
-
-    def pseudo_inverse(self, x):
-        res = 1/x
-        if type(res) == ImageData:
-            res.fill(np.nan_to_num(res.as_array(), nan=0, posinf=0, neginf=0))
-        else:
-            res = np.nan_to_num(res, nan=0, posinf=0, neginf=0)
-        return res
-
-    def direct(self, x):
-        return (self.diagonal) * (x)
-    
-    def adjoint(self, x):
-        return (self.diagonal) * (x)
-    
-    def get_inverse(self):
-        if type(self.diagonal) == jnp.ndarray:
-            return DiagonalOperator(self.pseudo_inverse(self.diagonal))
-        elif type(self.diagonal) == np.ndarray:
-            return DiagonalOperator(self.pseudo_inverse(self.diagonal))
-        elif type(self.diagonal) == ImageData:
-            ones = self.diagonal.get_uniform_copy(1)
-            return DiagonalOperator(ones / self.diagonal)
-
-    
 class ChannelwiseOperator(Operator):
 
     def __init__(self, operator, channel):
@@ -526,23 +455,6 @@ class ChannelwiseOperator(Operator):
         self.stored_array[..., self.channel] = adj
         return self.stored_array
         
-    
-class SIRFImageOperator(Operator):
-
-    def __init__(self, operator, domain_template_image, range_template_image):
-        self.operator = operator
-        self.domain_template_image = domain_template_image
-        self.range_template_image = range_template_image
-
-    def direct(self, x):
-        self.domain_template_image.fill(x.to_numpy())
-        self.range_template_image =  self.operator.direct(self.domain_template_image)
-        return jnp.array(self.range_template_image.as_array())
-    
-    def adjoint(self, x):
-        self.range_template_image.fill(x)
-        self.domain_template_image = self.operator.adjoint(self.range_template_image)
-        return jnp.array(self.domain_template_image.as_array())
     
 class SmoothingOperator(Operator):
     def __init__(self, fwhm):
@@ -588,9 +500,25 @@ class CompositionOperator(Operator):
 from stir import ZoomOptions, zoom_image, FloatVoxelsOnCartesianGrid
 from stirextra import to_numpy
 import os
-    
-class stirZoomOperator(Operator):
+
+class ZoomOperator(Operator):
     def __init__(self, ref, float, preserve = 'preserve_values', make_adjoint=True):
+        
+        # if ref has method zoom_image_from_template, use SIRFZoomOperator
+        if hasattr(ref, 'zoom_image_from_template'):
+            self.operator = SIRFZoomOperator(ref, float, preserve, make_adjoint)
+        else:
+            self.operator = STIRZoomOperator(ref, float, preserve, make_adjoint)
+            
+    def direct(self, x):
+        return self.operator.direct(x)
+    
+    def adjoint(self, x):
+        return self.operator.adjoint(x)
+    
+class STIRZoomOperator(Operator):
+    def __init__(self, ref, float, preserve = 'preserve_values', make_adjoint=True):
+        
         self.ref = ref.get_uniform_copy(1)
         self.float = float.get_uniform_copy(1)
         self.preserve = preserve # 'preserve_sum', 'preserve_values', 'preserve_projections'
@@ -600,10 +528,10 @@ class stirZoomOperator(Operator):
         i = random.randint(0, 1000000)
 
         self.ref.write(f'tmp_ref{i}.hv')
-        self.ref_stir = FloatVoxelsOnCartesianGrid.read_from_file(f'ref{i}.hv')
+        self.ref_stir = FloatVoxelsOnCartesianGrid.read_from_file(f'tmp_ref{i}.hv')
         os.remove(f'tmp_ref{i}.hv')
         self.float.write(f'tmp_float{i}.hv')
-        self.float_stir = FloatVoxelsOnCartesianGrid.read_from_file(f'float{i}.hv')
+        self.float_stir = FloatVoxelsOnCartesianGrid.read_from_file(f'tmp_float{i}.hv')
         os.remove(f'tmp_float{i}.hv')
 
         if make_adjoint:
@@ -620,20 +548,20 @@ class stirZoomOperator(Operator):
     def direct(self, x):
 
         self.ref_stir.fill(0)
-        self.float_stir.fill(x)
+        self.float_stir.fill(x.as_array().flat)
         zoom_image(self.ref_stir, self.float_stir, self.preserve)
 
         return self.ref.clone().fill(to_numpy(self.float_stir))
             
     def adjoint(self, x):
 
-        self.ref_stir.fill(x)
+        self.ref_stir.fill(x.as_array().flat)
         self.float_stir.fill(0)
         zoom_image(self.float_stir, self.ref_stir, self.preserve)
 
         return self.float.clone().fill(to_numpy(self.float_stir))
     
-class ZoomOperator(Operator):
+class SIRFZoomOperator(Operator):
     def __init__(self, ref, float, preserve = 'preserve_values', make_adjoint=True):
         self.ref = ref.get_uniform_copy(0)
         self.float = float.get_uniform_copy(0)
