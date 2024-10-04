@@ -2,7 +2,7 @@ import torch
 from torch import vmap
 import numpy as np
 
-from .Function import Function
+from Function import Function
 
 def pseudo_inverse_torch(H):
     """Inverse except when element is zero."""
@@ -77,7 +77,8 @@ class GPUVectorialTotalVariation(Function):
     """ 
     GPU implementation of the vectorial total variation function.
     """
-    def __init__(self, eps=0, norm = 'nuclear', smoothing_function=None, numpy_out=False):        
+    def __init__(self, eps=0, norm = 'nuclear', smoothing_function=None, weights=None,
+                 numpy_out=False):        
 
         """Initializes the GPUVectorialTotalVariation class.
         """        
